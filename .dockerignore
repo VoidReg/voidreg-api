@@ -1,0 +1,10 @@
+/target
+.git
+.github
+.env
+/data
+*.db
+*.db-wal
+*.db-shm
+tests
+*.md
