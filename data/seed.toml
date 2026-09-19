@@ -1,0 +1,151 @@
+[[projects]]
+slug = "minirt"
+title = "miniRT"
+category = "GRAPHICS"
+summary = "A ray tracer exploring the mathematics of light, surfaces, and image formation."
+tags = ["C", "Ray tracing", "Linear algebra"]
+has_detail_page = true
+featured = true
+sort_order = 0
+related_slugs = ["webserv", "csi-rs"]
+
+# Replace with a verified 16:9 render produced by miniRT.
+[projects.hero]
+label = "MINIRT RENDER PLACEHOLDER"
+text = "Replace with a real 16:9 render produced by miniRT."
+
+[[projects.sections]]
+heading = "Overview"
+kind = "prose"
+body = "miniRT explores how a scene becomes an image through explicit ray generation, geometric intersections, surface normals, and lighting calculations."
+
+[[projects.sections]]
+heading = "Project constraints"
+kind = "prose"
+body = "Build the renderer in C, keep the scene pipeline understandable, handle malformed input safely, and balance visual correctness with practical rendering time."
+
+[[projects.sections]]
+heading = "Implementation focus"
+kind = "prose"
+body = "The project focuses on object intersections, camera and ray construction, shading, texture mapping, and concurrency in the rendering path."
+
+[[projects.sections]]
+heading = "Rendering pipeline"
+kind = "prose"
+body = "Parse a scene, construct camera rays, evaluate the closest intersection, calculate material and lighting response, then write the resulting pixel."
+
+[[projects.sections]]
+heading = "RAY-TRACING PIPELINE"
+kind = "diagram"
+body = "Camera → Primary rays → Closest hit → Surface + lighting → Pixel output"
+
+[[projects.sections]]
+heading = "Render gallery"
+kind = "media"
+body = "PRIMARY RENDER / MATERIAL / TEXTURE / LIGHTING STUDY. Replace with verified miniRT output."
+
+[[projects.sections]]
+heading = "Outcomes and lessons"
+kind = "prose"
+body = "The work connects linear algebra with visible output and makes numerical edge cases concrete. Replace this summary with verified render results and measurements when they are available."
+
+[[projects.sections]]
+heading = "PROJECT ASSETS"
+kind = "callout"
+body = "The render and repository placeholders below must be replaced with verified miniRT assets before publication."
+
+[[projects]]
+slug = "webserv"
+title = "Webserv"
+category = "SYSTEMS"
+summary = "An HTTP server built around explicit protocol handling and operating-system constraints."
+tags = ["C++", "POSIX", "HTTP/1.1"]
+has_detail_page = false
+featured = true
+sort_order = 1
+
+[[projects]]
+slug = "csi-rs"
+title = "csi-rs"
+category = "RF / EMBEDDED"
+summary = "An open-source Rust stack for Wi-Fi CSI on ESP devices, from drivers to host streaming."
+tags = ["Rust", "ESP32", "Wi-Fi CSI"]
+has_detail_page = false
+featured = true
+sort_order = 2
+
+[[projects]]
+slug = "voidreg-design-engineering"
+title = "Voidreg Design Engineering"
+category = "DESIGN ENGINEERING"
+summary = "A theme-agnostic system for designing, validating, and implementing accessible interfaces."
+tags = ["TypeScript", "Penpot", "Tailwind CSS"]
+has_detail_page = false
+featured = false
+sort_order = 3
+
+[[articles]]
+slug = "how-to-validate-a-semantic-color-system"
+title = "How to validate a semantic color system"
+category = "DESIGN ENGINEERING"
+summary = "A practical approach to testing contrast, interaction states, and theme consistency."
+featured = true
+sort_order = 0
+
+[[articles.sections]]
+heading = "Start with semantic roles"
+kind = "prose"
+body = "A semantic palette describes the job of a color: foreground, surface, border, or action. It lets a component express intent without hard-coding one theme's appearance."
+
+[[articles.sections]]
+heading = "Test relationships, not swatches"
+kind = "prose"
+body = "Check foreground and background pairs in each actual component state. A passing body-text pair does not establish that a hover state, focus ring, or muted label is readable."
+
+[[articles.sections]]
+heading = "Keep the checks reproducible"
+kind = "prose"
+body = "Record the role pair, theme, state, and contrast result together. Test the same set after changing a token so regressions can be traced to a specific relationship."
+
+[[articles.sections]]
+heading = "CSS · illustrative excerpt"
+kind = "code"
+body = """--background: #FFFFFF;
+--foreground: #17212B;
+--primary: #9A3412;"""
+
+[[articles.sections]]
+heading = "Review the interface"
+kind = "prose"
+body = "Numeric checks complement visual review. Inspect rendered screens, long labels, and light/dark variants before treating a palette as ready for use."
+
+[[articles.sections]]
+heading = "Draft review"
+kind = "callout"
+body = "Technical accuracy, ownership, sources, dates, and external destinations must be reviewed before publication."
+
+[[articles]]
+slug = "what-building-an-http-server-teaches-about-protocol-design"
+title = "What building an HTTP server teaches about protocol design"
+category = "SYSTEMS"
+summary = "Parsing, connection lifecycles, and the boundary between a protocol and its implementation."
+featured = true
+sort_order = 1
+
+[[articles.sections]]
+heading = "Introduction"
+kind = "prose"
+body = "Parsing, connection lifecycles, and the boundary between a protocol and its implementation."
+
+[[articles]]
+slug = "designing-a-tangent-basis-for-normal-mapping"
+title = "Designing a tangent basis for normal mapping"
+category = "GRAPHICS"
+summary = "Connecting texture-space detail with the geometry of a rendered surface."
+featured = false
+sort_order = 2
+
+[[articles.sections]]
+heading = "Introduction"
+kind = "prose"
+body = "Connecting texture-space detail with the geometry of a rendered surface."

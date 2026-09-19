@@ -2,7 +2,9 @@
 .git
 .github
 .env
-/data
+/data/*.db
+/data/*.db-wal
+/data/*.db-shm
 *.db
 *.db-wal
 *.db-shm
