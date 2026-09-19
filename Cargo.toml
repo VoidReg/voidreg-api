@@ -53,10 +53,15 @@ panic = "unwind"
 [profile.dev.package."*"]
 opt-level = 3
 
+# cargo test defaults to this; keep it identical to dev so CI does not
+# compile a second "test" codegen of the same crates.
+[profile.test]
+inherits = "dev"
+
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = true
 debug = false

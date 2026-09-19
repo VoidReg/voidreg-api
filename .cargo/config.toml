@@ -2,4 +2,4 @@
 migrate = "run --bin migrate --no-default-features --"
 rel = "build --release --no-default-features"
 run-rel = "run --release --no-default-features"
-lint = "clippy --all-targets --all-features -- -D warnings"
+lint = "clippy --no-deps --all-targets --all-features -- -D warnings"

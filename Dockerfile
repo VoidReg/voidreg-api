@@ -19,6 +19,9 @@ COPY .cargo .cargo
 COPY src src
 COPY data data
 
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+
 RUN cargo build --release --no-default-features --locked --bin voidreg-api --bin migrate
 
 FROM debian:bookworm-slim
