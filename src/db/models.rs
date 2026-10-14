@@ -34,6 +34,10 @@ pub struct Article {
     pub published_at: Option<String>,
     pub reading_time_minutes: Option<i64>,
     pub sections: String,
+    pub document: String,
+    pub document_version: i64,
+    pub compiled: String,
+    pub content_hash: String,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -53,4 +57,43 @@ pub struct NewsletterSubscriber {
     pub id: uuid::Uuid,
     #[unique]
     pub email: String,
+}
+
+#[derive(Debug, toasty::Model)]
+pub struct Comment {
+    #[key]
+    #[auto]
+    pub id: uuid::Uuid,
+    pub article_slug: String,
+    pub identity_id: Option<String>,
+    pub author_name: String,
+    pub body: String,
+    pub status: String,
+    pub ip_hash: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, toasty::Model)]
+pub struct Identity {
+    #[key]
+    #[auto]
+    pub id: uuid::Uuid,
+    pub provider: String,
+    pub subject: String,
+    pub email: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, toasty::Model)]
+pub struct Session {
+    #[key]
+    #[auto]
+    pub id: uuid::Uuid,
+    #[unique]
+    pub token_hash: String,
+    pub kind: String,
+    pub identity_id: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
 }

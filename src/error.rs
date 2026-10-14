@@ -7,11 +7,19 @@ pub enum AppError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
-    Unprocessable(String),
+    Unauthorized(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Unprocessable(String),
+    #[error("{0}")]
+    TooManyRequests(String),
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error("database error: {0}")]
     Database(String),
     #[error("internal error")]
@@ -35,9 +43,13 @@ impl AppError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "bad_request",
-            Self::Unprocessable(_) => "unprocessable",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::Forbidden(_) => "forbidden",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::Unprocessable(_) => "unprocessable",
+            Self::TooManyRequests(_) => "rate_limited",
+            Self::ServiceUnavailable(_) => "unavailable",
             Self::Database(_) | Self::Internal(_) => "internal",
         }
     }
@@ -47,9 +59,13 @@ impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

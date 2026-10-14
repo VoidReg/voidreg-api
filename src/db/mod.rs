@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::domain::{Article, ArticleStatus, MediaPlaceholder, Project};
 use crate::error::AppError;
+use crate::util::{now_rfc3339, sha256_hex};
 
 mod models;
 mod seed;
@@ -13,6 +14,54 @@ mod seed;
 #[derive(Clone)]
 pub struct Db {
     inner: Arc<Mutex<toasty::Db>>,
+}
+
+/// Full set of stored fields for an article, used by insert and save.
+#[derive(Debug, Clone)]
+pub struct ArticleFields {
+    pub slug: String,
+    pub title: String,
+    pub category: String,
+    pub summary: String,
+    pub status: String,
+    pub featured: bool,
+    pub sort_order: i64,
+    pub published_at: Option<String>,
+    pub reading_time_minutes: Option<i64>,
+    pub sections: String,
+    pub document: String,
+    pub document_version: i64,
+    pub compiled: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub kind: String,
+    pub identity_id: Option<String>,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityInfo {
+    pub id: String,
+    pub provider: String,
+    pub subject: String,
+    pub email: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommentInfo {
+    pub id: String,
+    pub article_slug: String,
+    pub identity_id: Option<String>,
+    pub author_name: String,
+    pub body: String,
+    pub status: String,
+    pub created_at: String,
+    pub email: Option<String>,
 }
 
 impl Db {
@@ -32,8 +81,8 @@ impl Db {
     }
 
     pub async fn migrate(&self) -> Result<(), AppError> {
-        let db = self.inner.lock().await;
-        apply_schema(&db).await
+        let mut db = self.inner.lock().await;
+        apply_schema(&mut db).await
     }
 
     pub async fn seed_if_empty(&self) -> Result<(), AppError> {
@@ -74,15 +123,57 @@ impl Db {
         project_from_row(row)
     }
 
-    pub async fn list_articles(&self, featured: Option<bool>) -> Result<Vec<Article>, AppError> {
+    /// Published articles for the public blog index, newest first.
+    pub async fn list_published_articles(
+        &self,
+        featured: Option<bool>,
+    ) -> Result<Vec<Article>, AppError> {
         let mut db = self.inner.lock().await;
         let rows = if featured == Some(true) {
-            models::Article::filter(models::Article::fields().featured().eq(true))
-                .exec(&mut *db)
-                .await?
+            models::Article::filter(toasty::stmt::Expr::and(
+                models::Article::fields()
+                    .status()
+                    .eq(ArticleStatus::Published.as_str()),
+                models::Article::fields().featured().eq(true),
+            ))
+            .exec(&mut *db)
+            .await?
         } else {
-            models::Article::all().exec(&mut *db).await?
+            models::Article::filter(
+                models::Article::fields()
+                    .status()
+                    .eq(ArticleStatus::Published.as_str()),
+            )
+            .exec(&mut *db)
+            .await?
         };
+        let mut items = rows
+            .into_iter()
+            .map(article_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        sort_articles_public(&mut items);
+        Ok(items.into_iter().map(|item| item.as_card()).collect())
+    }
+
+    /// Full published article for the public detail view.
+    pub async fn get_published_article(&self, slug: &str) -> Result<Article, AppError> {
+        let mut db = self.inner.lock().await;
+        let row = models::Article::filter_by_slug(slug)
+            .first()
+            .exec(&mut *db)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("article '{slug}' not found")))?;
+        let article = article_from_row(row)?;
+        if article.status != ArticleStatus::Published {
+            return Err(AppError::NotFound(format!("article '{slug}' not found")));
+        }
+        Ok(article)
+    }
+
+    /// All articles for the admin dashboard, cards only.
+    pub async fn admin_list_articles(&self) -> Result<Vec<Article>, AppError> {
+        let mut db = self.inner.lock().await;
+        let rows = models::Article::all().exec(&mut *db).await?;
         let mut items = rows
             .into_iter()
             .map(article_from_row)
@@ -91,7 +182,8 @@ impl Db {
         Ok(items.into_iter().map(|item| item.as_card()).collect())
     }
 
-    pub async fn get_article(&self, slug: &str) -> Result<Article, AppError> {
+    /// Full article (including document and compiled artifact) for the editor.
+    pub async fn admin_get_article(&self, slug: &str) -> Result<Article, AppError> {
         let mut db = self.inner.lock().await;
         let row = models::Article::filter_by_slug(slug)
             .first()
@@ -99,6 +191,91 @@ impl Db {
             .await?
             .ok_or_else(|| AppError::NotFound(format!("article '{slug}' not found")))?;
         article_from_row(row)
+    }
+
+    pub async fn article_exists(&self, slug: &str) -> Result<bool, AppError> {
+        let mut db = self.inner.lock().await;
+        Ok(models::Article::filter_by_slug(slug)
+            .first()
+            .exec(&mut *db)
+            .await?
+            .is_some())
+    }
+
+    pub async fn insert_article(&self, fields: ArticleFields) -> Result<Article, AppError> {
+        let mut db = self.inner.lock().await;
+        let row = toasty::create!(models::Article {
+            slug: fields.slug,
+            title: fields.title,
+            category: fields.category,
+            summary: fields.summary,
+            status: fields.status,
+            featured: fields.featured,
+            sort_order: fields.sort_order,
+            published_at: fields.published_at,
+            reading_time_minutes: fields.reading_time_minutes,
+            sections: fields.sections,
+            document: fields.document,
+            document_version: fields.document_version,
+            compiled: fields.compiled,
+            content_hash: fields.content_hash,
+        })
+        .exec(&mut *db)
+        .await?;
+        article_from_row(row)
+    }
+
+    /// Saves every writable field of an article identified by its (current)
+    /// slug.
+    pub async fn save_article(&self, fields: &ArticleFields) -> Result<Article, AppError> {
+        let mut db = self.inner.lock().await;
+        let slug = fields.slug.clone();
+        let title = fields.title.clone();
+        let category = fields.category.clone();
+        let summary = fields.summary.clone();
+        let status = fields.status.clone();
+        let featured = fields.featured;
+        let sort_order = fields.sort_order;
+        let published_at = fields.published_at.clone();
+        let reading_time_minutes = fields.reading_time_minutes;
+        let sections = fields.sections.clone();
+        let document = fields.document.clone();
+        let document_version = fields.document_version;
+        let compiled = fields.compiled.clone();
+        let content_hash = fields.content_hash.clone();
+        toasty::update!(models::Article::filter_by_slug(slug) {
+            title,
+            category,
+            summary,
+            status,
+            featured,
+            sort_order,
+            published_at,
+            reading_time_minutes,
+            sections,
+            document,
+            document_version,
+            compiled,
+            content_hash,
+        })
+        .exec(&mut *db)
+        .await?;
+        let slug = fields.slug.clone();
+        let row = models::Article::filter_by_slug(slug)
+            .first()
+            .exec(&mut *db)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("article '{}' not found", fields.slug)))?;
+        article_from_row(row)
+    }
+
+    pub async fn delete_article(&self, slug: &str) -> Result<(), AppError> {
+        let mut db = self.inner.lock().await;
+        models::Article::filter_by_slug(slug)
+            .delete()
+            .exec(&mut *db)
+            .await?;
+        Ok(())
     }
 
     pub async fn insert_contact(
@@ -135,22 +312,414 @@ impl Db {
         .await?;
         Ok(())
     }
-}
 
-async fn apply_schema(db: &toasty::Db) -> Result<(), AppError> {
-    match db.push_schema().await {
-        Ok(()) => Ok(()),
-        Err(err) if schema_already_exists(&err) => {
-            tracing::info!("database schema already exists, skipping create");
-            Ok(())
+    // Comments
+
+    pub async fn insert_comment(
+        &self,
+        article_slug: &str,
+        identity_id: Option<&str>,
+        author_name: &str,
+        body: &str,
+        status: &str,
+        ip_hash: &str,
+    ) -> Result<CommentInfo, AppError> {
+        let mut db = self.inner.lock().await;
+        let created_at = now_rfc3339();
+        let row = toasty::create!(models::Comment {
+            article_slug: article_slug.to_owned(),
+            identity_id: identity_id.map(str::to_owned),
+            author_name: author_name.to_owned(),
+            body: body.to_owned(),
+            status: status.to_owned(),
+            ip_hash: ip_hash.to_owned(),
+            created_at,
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(comment_from_row(row))
+    }
+
+    /// Approved comments for an article, newest first. Pagination is applied
+    /// in memory; comment volume is small at this site's scale.
+    pub async fn list_public_comments(
+        &self,
+        article_slug: &str,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<CommentInfo>, i64), AppError> {
+        let mut db = self.inner.lock().await;
+        let rows = models::Comment::filter(toasty::stmt::Expr::and(
+            models::Comment::fields().article_slug().eq(article_slug),
+            models::Comment::fields().status().eq("approved"),
+        ))
+        .exec(&mut *db)
+        .await?;
+        let mut items: Vec<CommentInfo> = rows.into_iter().map(comment_from_row).collect();
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let total = items.len() as i64;
+        let start = page.saturating_sub(1).saturating_mul(per_page).max(0) as usize;
+        let page_items = items
+            .into_iter()
+            .skip(start)
+            .take(per_page.max(0) as usize)
+            .collect();
+        Ok((page_items, total))
+    }
+
+    /// All comments matching `status` (None = every status), newest first.
+    pub async fn list_admin_comments(
+        &self,
+        status: Option<&str>,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<CommentInfo>, i64), AppError> {
+        let mut db = self.inner.lock().await;
+        let rows = match status {
+            Some(status) => {
+                models::Comment::filter(models::Comment::fields().status().eq(status))
+                    .exec(&mut *db)
+                    .await?
+            }
+            None => models::Comment::all().exec(&mut *db).await?,
+        };
+        let mut items: Vec<CommentInfo> = rows.into_iter().map(comment_from_row).collect();
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let total = items.len() as i64;
+        let start = page.saturating_sub(1).saturating_mul(per_page).max(0) as usize;
+        let page_items = items
+            .into_iter()
+            .skip(start)
+            .take(per_page.max(0) as usize)
+            .collect();
+        Ok((page_items, total))
+    }
+
+    pub async fn get_comment(&self, id: &str) -> Result<Option<CommentInfo>, AppError> {
+        let mut db = self.inner.lock().await;
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Ok(None);
+        };
+        let row = models::Comment::filter_by_id(uuid)
+            .first()
+            .exec(&mut *db)
+            .await?;
+        Ok(row.map(comment_from_row))
+    }
+
+    pub async fn approve_comment(&self, id: &str) -> Result<(), AppError> {
+        let mut db = self.inner.lock().await;
+        let uuid = parse_uuid(id)?;
+        toasty::update!(models::Comment::filter_by_id(uuid) {
+            status: "approved".to_owned(),
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_comment(&self, id: &str) -> Result<(), AppError> {
+        let mut db = self.inner.lock().await;
+        let uuid = parse_uuid(id)?;
+        models::Comment::filter_by_id(uuid)
+            .delete()
+            .exec(&mut *db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn count_comments_by_ip_since(
+        &self,
+        ip_hash: &str,
+        since: &str,
+        article_slug: Option<&str>,
+    ) -> Result<i64, AppError> {
+        let mut db = self.inner.lock().await;
+        let rows = models::Comment::filter(models::Comment::fields().ip_hash().eq(ip_hash))
+            .exec(&mut *db)
+            .await?;
+        let count = rows
+            .into_iter()
+            .map(comment_from_row)
+            .filter(|comment| comment.created_at.as_str() >= since)
+            .filter(|comment| article_slug.is_none_or(|slug| comment.article_slug == slug))
+            .count() as i64;
+        Ok(count)
+    }
+
+    // Identities
+
+    pub async fn find_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<IdentityInfo>, AppError> {
+        let mut db = self.inner.lock().await;
+        let rows = models::Identity::filter(toasty::stmt::Expr::and(
+            models::Identity::fields().provider().eq(provider),
+            models::Identity::fields().subject().eq(subject),
+        ))
+        .exec(&mut *db)
+        .await?;
+        Ok(rows.into_iter().next().map(identity_from_row))
+    }
+
+    pub async fn upsert_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        email: &str,
+        name: &str,
+        avatar_url: Option<&str>,
+    ) -> Result<IdentityInfo, AppError> {
+        let mut db = self.inner.lock().await;
+        let existing = self.find_identity_inner(&mut db, provider, subject).await?;
+        if let Some(row) = existing {
+            let id = row.id;
+            toasty::update!(models::Identity::filter_by_id(id) {
+                email: email.to_owned(),
+                name: name.to_owned(),
+                avatar_url: avatar_url.map(str::to_owned),
+            })
+            .exec(&mut *db)
+            .await?;
+            let row = models::Identity::filter_by_id(id)
+                .first()
+                .exec(&mut *db)
+                .await?
+                .ok_or_else(|| AppError::Internal("identity vanished during update".to_owned()))?;
+            return Ok(identity_from_row(row));
         }
-        Err(err) => Err(err.into()),
+        let row = toasty::create!(models::Identity {
+            provider: provider.to_owned(),
+            subject: subject.to_owned(),
+            email: email.to_owned(),
+            name: name.to_owned(),
+            avatar_url: avatar_url.map(str::to_owned),
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(identity_from_row(row))
+    }
+
+    async fn find_identity_inner(
+        &self,
+        db: &mut toasty::Db,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<models::Identity>, AppError> {
+        let rows = models::Identity::filter(toasty::stmt::Expr::and(
+            models::Identity::fields().provider().eq(provider),
+            models::Identity::fields().subject().eq(subject),
+        ))
+        .exec(db)
+        .await?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Resolves a commenter identity by its stored id string.
+    pub async fn get_identity_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::domain::CommenterIdentity>, AppError> {
+        let mut db = self.inner.lock().await;
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Ok(None);
+        };
+        let row = models::Identity::filter_by_id(uuid)
+            .first()
+            .exec(&mut *db)
+            .await?;
+        Ok(row.map(|row| crate::domain::CommenterIdentity {
+            id: row.id.to_string(),
+            provider: row.provider,
+            name: row.name,
+            email: row.email,
+            avatar_url: row.avatar_url,
+        }))
+    }
+
+    // Sessions
+
+    pub async fn create_session(
+        &self,
+        kind: &str,
+        token_hash: &str,
+        identity_id: Option<&str>,
+        ttl_hours: i64,
+    ) -> Result<(), AppError> {
+        let mut db = self.inner.lock().await;
+        self.delete_expired_sessions_inner(&mut db).await?;
+        toasty::create!(models::Session {
+            token_hash: token_hash.to_owned(),
+            kind: kind.to_owned(),
+            identity_id: identity_id.map(str::to_owned),
+            created_at: now_rfc3339(),
+            expires_at: crate::util::rfc3339_plus_hours(ttl_hours),
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns the live session for a token hash, or None when missing or
+    /// expired. Expired sessions are deleted opportunistically.
+    pub async fn get_live_session(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<SessionInfo>, AppError> {
+        let mut db = self.inner.lock().await;
+        let row = models::Session::filter_by_token_hash(token_hash)
+            .first()
+            .exec(&mut *db)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let now = now_rfc3339();
+        if row.expires_at < now {
+            models::Session::filter_by_id(row.id)
+                .delete()
+                .exec(&mut *db)
+                .await?;
+            return Ok(None);
+        }
+        Ok(Some(SessionInfo {
+            kind: row.kind,
+            identity_id: row.identity_id,
+            expires_at: row.expires_at,
+        }))
+    }
+
+    pub async fn delete_session(&self, token_hash: &str) -> Result<(), AppError> {
+        let mut db = self.inner.lock().await;
+        models::Session::filter_by_token_hash(token_hash)
+            .delete()
+            .exec(&mut *db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_expired_sessions_inner(&self, db: &mut toasty::Db) -> Result<(), AppError> {
+        let now = now_rfc3339();
+        let rows = models::Session::filter(models::Session::fields().expires_at().lt(now))
+            .exec(db)
+            .await?;
+        for row in rows {
+            models::Session::filter_by_id(row.id)
+                .delete()
+                .exec(db)
+                .await?;
+        }
+        Ok(())
     }
 }
 
-fn schema_already_exists(err: &toasty::Error) -> bool {
-    err.to_string().contains("already exists")
+/// Content hash backing public ETags: a digest over every reader-visible
+/// field of an article.
+pub fn compute_content_hash(fields: &ArticleFields) -> String {
+    let mut input = String::new();
+    input.push_str(fields.slug.as_str());
+    input.push('\u{1f}');
+    input.push_str(fields.title.as_str());
+    input.push('\u{1f}');
+    input.push_str(fields.category.as_str());
+    input.push('\u{1f}');
+    input.push_str(fields.summary.as_str());
+    input.push('\u{1f}');
+    input.push_str(if fields.featured { "featured" } else { "plain" });
+    input.push('\u{1f}');
+    input.push_str(&fields.published_at.clone().unwrap_or_default());
+    input.push('\u{1f}');
+    input.push_str(&fields.reading_time_minutes.unwrap_or(0).to_string());
+    input.push('\u{1f}');
+    input.push_str(&fields.sections);
+    input.push('\u{1f}');
+    input.push_str(&fields.document);
+    input.push('\u{1f}');
+    input.push_str(&fields.compiled);
+    sha256_hex(input.as_bytes())
 }
+
+fn sort_articles_public(articles: &mut [Article]) {
+    articles.sort_by(|a, b| {
+        let a_key = a.published_at.clone().unwrap_or_default();
+        let b_key = b.published_at.clone().unwrap_or_default();
+        b_key
+            .cmp(&a_key)
+            .then(a.sort_order.cmp(&b.sort_order))
+            .then(a.slug.cmp(&b.slug))
+    });
+}
+
+fn parse_uuid(value: &str) -> Result<uuid::Uuid, AppError> {
+    uuid::Uuid::parse_str(value)
+        .map_err(|_| AppError::NotFound(format!("no record with id '{value}'")))
+}
+
+async fn apply_schema(db: &mut toasty::Db) -> Result<(), AppError> {
+    for statement in SCHEMA_STATEMENTS.iter().copied() {
+        toasty::sql::statement(statement).exec(&mut *db).await?;
+    }
+
+    // SQLite cannot add a column idempotently; tolerate duplicate-column
+    // errors from databases that already carry the new articles columns.
+    for (column, statement) in ARTICLE_COLUMN_ADDITIONS.iter().copied() {
+        if let Err(err) = toasty::sql::statement(statement).exec(&mut *db).await {
+            let message = err.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(AppError::Database(message));
+            }
+            tracing::debug!(column, "articles column already present");
+        }
+    }
+
+    Ok(())
+}
+
+/// Idempotent DDL matching the toasty-generated storage layout. Fresh
+/// databases get the full schema; existing ones only gain missing tables and
+/// indexes.
+const SCHEMA_STATEMENTS: &[&str] = &[
+    r#"CREATE TABLE IF NOT EXISTS "projects" ("id" BLOB NOT NULL, "slug" TEXT NOT NULL, "title" TEXT NOT NULL, "category" TEXT NOT NULL, "summary" TEXT NOT NULL, "tags" TEXT NOT NULL, "sections" TEXT NOT NULL, "hero" TEXT, "has_detail_page" BOOLEAN NOT NULL, "featured" BOOLEAN NOT NULL, "sort_order" BIGINT NOT NULL, "repo_url" TEXT, "related_slugs" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_projects_by_slug" ON "projects" ("slug")"#,
+    // articles: base columns shared with pre-document databases
+    r#"CREATE TABLE IF NOT EXISTS "articles" ("id" BLOB NOT NULL, "slug" TEXT NOT NULL, "title" TEXT NOT NULL, "category" TEXT NOT NULL, "summary" TEXT NOT NULL, "status" TEXT NOT NULL, "featured" BOOLEAN NOT NULL, "sort_order" BIGINT NOT NULL, "published_at" TEXT, "reading_time_minutes" BIGINT, "sections" TEXT NOT NULL, "document" TEXT NOT NULL DEFAULT '', "document_version" BIGINT NOT NULL DEFAULT 0, "compiled" TEXT NOT NULL DEFAULT '', "content_hash" TEXT NOT NULL DEFAULT '', PRIMARY KEY ("id"))"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_articles_by_slug" ON "articles" ("slug")"#,
+    r#"CREATE TABLE IF NOT EXISTS "contact_messages" ("id" BLOB NOT NULL, "name" TEXT NOT NULL, "email" TEXT NOT NULL, "message" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
+    r#"CREATE TABLE IF NOT EXISTS "newsletter_subscribers" ("id" BLOB NOT NULL, "email" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_newsletter_subscribers_by_email" ON "newsletter_subscribers" ("email")"#,
+    r#"CREATE TABLE IF NOT EXISTS "comments" ("id" BLOB NOT NULL, "article_slug" TEXT NOT NULL, "identity_id" TEXT, "author_name" TEXT NOT NULL, "body" TEXT NOT NULL, "status" TEXT NOT NULL, "ip_hash" TEXT NOT NULL, "created_at" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
+    r#"CREATE INDEX IF NOT EXISTS "index_comments_by_article_slug" ON "comments" ("article_slug")"#,
+    r#"CREATE INDEX IF NOT EXISTS "index_comments_by_status" ON "comments" ("status")"#,
+    r#"CREATE INDEX IF NOT EXISTS "index_comments_by_ip_hash" ON "comments" ("ip_hash")"#,
+    r#"CREATE TABLE IF NOT EXISTS "identities" ("id" BLOB NOT NULL, "provider" TEXT NOT NULL, "subject" TEXT NOT NULL, "email" TEXT NOT NULL, "name" TEXT NOT NULL, "avatar_url" TEXT, PRIMARY KEY ("id"))"#,
+    r#"CREATE INDEX IF NOT EXISTS "index_identities_by_provider" ON "identities" ("provider")"#,
+    r#"CREATE TABLE IF NOT EXISTS "sessions" ("id" BLOB NOT NULL, "token_hash" TEXT NOT NULL, "kind" TEXT NOT NULL, "identity_id" TEXT, "created_at" TEXT NOT NULL, "expires_at" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_sessions_by_token_hash" ON "sessions" ("token_hash")"#,
+    r#"CREATE INDEX IF NOT EXISTS "index_sessions_by_expires_at" ON "sessions" ("expires_at")"#,
+];
+
+/// Column additions for databases created before articles stored Publisle
+/// documents.
+const ARTICLE_COLUMN_ADDITIONS: &[(&str, &str)] = &[
+    (
+        "document",
+        r#"ALTER TABLE "articles" ADD COLUMN "document" TEXT NOT NULL DEFAULT ''"#,
+    ),
+    (
+        "document_version",
+        r#"ALTER TABLE "articles" ADD COLUMN "document_version" BIGINT NOT NULL DEFAULT 0"#,
+    ),
+    (
+        "compiled",
+        r#"ALTER TABLE "articles" ADD COLUMN "compiled" TEXT NOT NULL DEFAULT ''"#,
+    ),
+    (
+        "content_hash",
+        r#"ALTER TABLE "articles" ADD COLUMN "content_hash" TEXT NOT NULL DEFAULT ''"#,
+    ),
+];
 
 async fn connect_toasty(url: &str, token: &str) -> Result<toasty::Db, AppError> {
     if url == "memory" || url == "turso::memory:" {
@@ -192,7 +761,10 @@ fn model_set() -> toasty::ModelSet {
         crate::db::models::Project,
         crate::db::models::Article,
         crate::db::models::ContactMessage,
-        crate::db::models::NewsletterSubscriber
+        crate::db::models::NewsletterSubscriber,
+        crate::db::models::Comment,
+        crate::db::models::Identity,
+        crate::db::models::Session
     )
 }
 
@@ -218,6 +790,16 @@ fn project_from_row(row: models::Project) -> Result<Project, AppError> {
 }
 
 fn article_from_row(row: models::Article) -> Result<Article, AppError> {
+    let document = if row.document.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&row.document)?)
+    };
+    let compiled = if row.compiled.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&row.compiled)?)
+    };
     Ok(Article {
         slug: row.slug,
         title: row.title,
@@ -229,5 +811,32 @@ fn article_from_row(row: models::Article) -> Result<Article, AppError> {
         published_at: row.published_at,
         reading_time_minutes: row.reading_time_minutes,
         sections: serde_json::from_str(&row.sections)?,
+        document,
+        compiled,
+        content_hash: row.content_hash,
     })
+}
+
+fn comment_from_row(row: models::Comment) -> CommentInfo {
+    CommentInfo {
+        id: row.id.to_string(),
+        article_slug: row.article_slug,
+        identity_id: row.identity_id,
+        author_name: row.author_name,
+        body: row.body,
+        status: row.status,
+        created_at: row.created_at,
+        email: None,
+    }
+}
+
+fn identity_from_row(row: models::Identity) -> IdentityInfo {
+    IdentityInfo {
+        id: row.id.to_string(),
+        provider: row.provider,
+        subject: row.subject,
+        email: row.email,
+        name: row.name,
+        avatar_url: row.avatar_url,
+    }
 }

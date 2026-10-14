@@ -77,20 +77,12 @@ async fn lists_and_gets_blogs() {
 
     let req = test::TestRequest::get().uri("/api/v1/blogs").to_request();
     let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
-    assert_eq!(body["items"].as_array().unwrap().len(), 3);
-
-    let req = test::TestRequest::get()
-        .uri("/api/v1/blogs?featured=true")
-        .to_request();
-    let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
-    assert_eq!(body["items"].as_array().unwrap().len(), 2);
-
+    assert!(body["items"].as_array().unwrap().is_empty());
     let req = test::TestRequest::get()
         .uri("/api/v1/blogs/how-to-validate-a-semantic-color-system")
         .to_request();
-    let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
-    assert_eq!(body["status"], "draft");
-    assert!(body["sections"].as_array().unwrap().len() > 1);
+    let response = test::call_service(&app, req).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[actix_web::test]

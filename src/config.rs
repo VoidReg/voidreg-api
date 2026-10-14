@@ -13,6 +13,16 @@ pub struct Config {
     pub resend_domain: String,
     pub resend_from_user: String,
     pub contact_to_email: String,
+    pub admin_password: Option<String>,
+    pub admin_password_hash: Option<String>,
+    pub admin_session_ttl_hours: i64,
+    pub public_base_url: String,
+    pub google_client_id: Option<String>,
+    pub google_client_secret: Option<String>,
+    pub github_client_id: Option<String>,
+    pub github_client_secret: Option<String>,
+    pub commenter_redirect_url: Option<String>,
+    pub comment_ip_salt: String,
 }
 
 #[derive(Debug, Error)]
@@ -21,6 +31,15 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("invalid PORT value")]
     InvalidPort,
+    #[error("invalid ADMIN_SESSION_TTL_HOURS value")]
+    InvalidSessionTtl,
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 impl Config {
@@ -50,6 +69,17 @@ impl Config {
             env::var("RESEND_FROM_USER").map_err(|_| ConfigError::Missing("RESEND_FROM_USER"))?;
         let contact_to_email =
             env::var("CONTACT_TO_EMAIL").map_err(|_| ConfigError::Missing("CONTACT_TO_EMAIL"))?;
+        let admin_session_ttl_hours = optional_env("ADMIN_SESSION_TTL_HOURS")
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .map_err(|_| ConfigError::InvalidSessionTtl)
+            })
+            .transpose()?
+            .unwrap_or(72);
+        if admin_session_ttl_hours <= 0 {
+            return Err(ConfigError::InvalidSessionTtl);
+        }
 
         Ok(Self {
             host,
@@ -61,6 +91,17 @@ impl Config {
             resend_domain,
             resend_from_user,
             contact_to_email,
+            admin_password: optional_env("ADMIN_PASSWORD"),
+            admin_password_hash: optional_env("ADMIN_PASSWORD_HASH"),
+            admin_session_ttl_hours,
+            public_base_url: optional_env("PUBLIC_BASE_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned()),
+            google_client_id: optional_env("GOOGLE_CLIENT_ID"),
+            google_client_secret: optional_env("GOOGLE_CLIENT_SECRET"),
+            github_client_id: optional_env("GITHUB_CLIENT_ID"),
+            github_client_secret: optional_env("GITHUB_CLIENT_SECRET"),
+            commenter_redirect_url: optional_env("COMMENTER_REDIRECT_URL"),
+            comment_ip_salt: optional_env("COMMENT_IP_SALT").unwrap_or_default(),
         })
     }
 
@@ -75,6 +116,16 @@ impl Config {
             resend_domain: "mail.example.com".to_owned(),
             resend_from_user: "form".to_owned(),
             contact_to_email: "admin@example.com".to_owned(),
+            admin_password: Some("voidreg-test-admin".to_owned()),
+            admin_password_hash: None,
+            admin_session_ttl_hours: 72,
+            public_base_url: "http://127.0.0.1:8080".to_owned(),
+            google_client_id: None,
+            google_client_secret: None,
+            github_client_id: None,
+            github_client_secret: None,
+            commenter_redirect_url: None,
+            comment_ip_salt: "test-comment-salt".to_owned(),
         }
     }
 
@@ -84,5 +135,33 @@ impl Config {
 
     pub fn resend_from(&self) -> String {
         format!("Voidreg <{}@{}>", self.resend_from_user, self.resend_domain)
+    }
+
+    pub fn admin_auth_configured(&self) -> bool {
+        self.admin_password.is_some() || self.admin_password_hash.is_some()
+    }
+
+    pub fn oauth_provider(&self, provider: &str) -> Option<(&str, &str)> {
+        match provider {
+            "google" => Some((
+                self.google_client_id.as_deref()?,
+                self.google_client_secret.as_deref()?,
+            )),
+            "github" => Some((
+                self.github_client_id.as_deref()?,
+                self.github_client_secret.as_deref()?,
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn commenter_redirect(&self) -> String {
+        self.commenter_redirect_url
+            .clone()
+            .unwrap_or_else(|| format!("{}/blog", self.public_base_url))
+    }
+
+    pub fn oauth_redirect_uri(&self, provider: &str) -> String {
+        format!("{}/api/v1/auth/{provider}/callback", self.public_base_url)
     }
 }

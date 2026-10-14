@@ -1,0 +1,465 @@
+use actix_web::http::header;
+use actix_web::{HttpRequest, HttpResponse, delete, get, web};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::Deserialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::auth::extract::OptionalCommenter;
+use crate::auth::{
+    OAUTH_STATE_COOKIE, OAUTH_VERIFIER_COOKIE, SESSION_KIND_COMMENTER, commenter_expired_cookie,
+    commenter_session_cookie, cookie_token, expired_oauth_cookies, new_session_token,
+    oauth_state_cookie, oauth_verifier_cookie,
+};
+use crate::config::Config;
+use crate::db::Db;
+use crate::domain::CommenterSessionResponse;
+use crate::error::AppError;
+use crate::util::constant_time_eq;
+
+const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+const GITHUB_AUTH_URL: &str = "https://github.com/login/oauth/authorize";
+const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const GITHUB_USER_URL: &str = "https://api.github.com/user";
+const GITHUB_EMAILS_URL: &str = "https://api.github.com/user/emails";
+
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/api/v1/auth/{provider}/start",
+    tag = "auth",
+    params(("provider" = String, Path, description = "google or github")),
+    responses(
+        (status = 302, description = "Redirect to the provider"),
+        (status = 503, description = "Provider not configured", body = crate::error::ErrorBody)
+    )
+))]
+#[get("/auth/{provider}/start")]
+pub async fn start(
+    config: web::Data<Config>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    let provider = path.into_inner();
+    config
+        .oauth_provider(&provider)
+        .ok_or_else(|| oauth_unavailable(&provider))?;
+
+    let state = format!("{provider}:{}", crate::util::random_token());
+    let mut response = HttpResponse::Found();
+    match provider.as_str() {
+        "google" => {
+            let verifier = crate::util::random_token();
+            let challenge = pkce_challenge(&verifier);
+            let redirect = format!(
+                "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+                GOOGLE_AUTH_URL,
+                urlencode(config.google_client_id.as_deref().unwrap_or_default()),
+                urlencode(&config.oauth_redirect_uri("google")),
+                urlencode("openid email profile"),
+                urlencode(&state),
+                urlencode(&challenge),
+            );
+            apply_oauth_cookies(&mut response, &config, &state, Some(&verifier));
+            response.insert_header((header::LOCATION, redirect.as_str()));
+        }
+        "github" => {
+            let verifier = crate::util::random_token();
+            let challenge = pkce_challenge(&verifier);
+            let redirect = format!(
+                "{}?client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+                GITHUB_AUTH_URL,
+                urlencode(config.github_client_id.as_deref().unwrap_or_default()),
+                urlencode(&config.oauth_redirect_uri("github")),
+                urlencode("read:user user:email"),
+                urlencode(&state),
+                urlencode(&challenge),
+            );
+            apply_oauth_cookies(&mut response, &config, &state, Some(&verifier));
+            response.insert_header((header::LOCATION, redirect.as_str()));
+        }
+        other => return Err(oauth_unavailable(other)),
+    }
+
+    Ok(response.finish())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OAuthCallbackQuery {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+}
+
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/api/v1/auth/{provider}/callback",
+    tag = "auth",
+    params(
+        ("provider" = String, Path, description = "google or github"),
+        ("code" = Option<String>, Query, description = "Provider authorization code"),
+        ("state" = Option<String>, Query, description = "State echoed by the provider")
+    ),
+    responses(
+        (status = 302, description = "Redirect back to the site with a commenter session"),
+        (status = 400, description = "Invalid state or missing code", body = crate::error::ErrorBody),
+        (status = 503, description = "Provider not configured", body = crate::error::ErrorBody)
+    )
+))]
+#[get("/auth/{provider}/callback")]
+pub async fn callback(
+    db: web::Data<Db>,
+    config: web::Data<Config>,
+    path: web::Path<String>,
+    query: web::Query<OAuthCallbackQuery>,
+    request: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    let provider = path.into_inner();
+    config
+        .oauth_provider(&provider)
+        .ok_or_else(|| oauth_unavailable(&provider))?;
+
+    let returned_state = query
+        .state
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("missing state".to_owned()))?;
+    let expected_state = cookie_token(&request, OAUTH_STATE_COOKIE)
+        .ok_or_else(|| AppError::BadRequest("expired OAuth state; try again".to_owned()))?;
+    if !expected_state.starts_with(&format!("{provider}:"))
+        || !constant_time_eq(expected_state.as_bytes(), returned_state.as_bytes())
+    {
+        return Err(AppError::BadRequest("OAuth state mismatch".to_owned()));
+    }
+
+    if let Some(error) = &query.error {
+        return redirect_after_failure(&config, error);
+    }
+    let code = query
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| AppError::BadRequest("missing authorization code".to_owned()))?;
+    let verifier = cookie_token(&request, OAUTH_VERIFIER_COOKIE)
+        .ok_or_else(|| AppError::BadRequest("expired PKCE verifier; try again".to_owned()))?;
+
+    let profile = match provider.as_str() {
+        "google" => {
+            let access = exchange_google(&config, code, Some(&verifier)).await?;
+            fetch_google_profile(&access).await?
+        }
+        "github" => {
+            let access = exchange_github(&config, code, &verifier).await?;
+            fetch_github_profile(&access).await?
+        }
+        other => return Err(oauth_unavailable(other)),
+    };
+
+    let identity = db
+        .upsert_identity(
+            &provider,
+            &profile.subject,
+            &profile.email,
+            &profile.name,
+            profile.avatar_url.as_deref(),
+        )
+        .await?;
+
+    let (token, token_hash) = new_session_token();
+    db.create_session(
+        SESSION_KIND_COMMENTER,
+        &token_hash,
+        Some(&identity.id),
+        config.admin_session_ttl_hours,
+    )
+    .await?;
+
+    let mut response = HttpResponse::Found();
+    for cookie in expired_oauth_cookies(&config) {
+        response.cookie(cookie);
+    }
+    response.cookie(commenter_session_cookie(&config, &token));
+    let redirect = config.commenter_redirect();
+    response.insert_header((header::LOCATION, redirect.as_str()));
+    Ok(response.finish())
+}
+
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/api/v1/auth/session",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Current commenter identity", body = CommenterSessionResponse)
+    )
+))]
+#[get("/auth/session")]
+pub async fn show_session(commenter: OptionalCommenter) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(CommenterSessionResponse::from(commenter.identity)))
+}
+
+#[cfg_attr(feature = "swagger", utoipa::path(
+    delete,
+    path = "/api/v1/auth/session",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Commenter session cleared", body = CommenterSessionResponse)
+    )
+))]
+#[delete("/auth/session")]
+pub async fn clear_session(
+    db: web::Data<Db>,
+    config: web::Data<Config>,
+    request: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    if let Some(token) = cookie_token(&request, crate::auth::COMMENTER_SESSION_COOKIE) {
+        db.delete_session(&crate::auth::hash_token(&token)).await?;
+    }
+    Ok(HttpResponse::Ok()
+        .cookie(commenter_expired_cookie(&config))
+        .json(CommenterSessionResponse {
+            authenticated: false,
+            identity: None,
+        }))
+}
+
+struct OAuthProfile {
+    subject: String,
+    email: String,
+    name: String,
+    avatar_url: Option<String>,
+}
+
+fn oauth_unavailable(provider: &str) -> AppError {
+    AppError::ServiceUnavailable(format!(
+        "OAuth provider '{provider}' is not configured; set its client id and secret to enable sign-in"
+    ))
+}
+
+fn apply_oauth_cookies(
+    response: &mut actix_web::HttpResponseBuilder,
+    config: &Config,
+    state: &str,
+    verifier: Option<&str>,
+) {
+    response.cookie(oauth_state_cookie(config, state));
+    if let Some(verifier) = verifier {
+        response.cookie(oauth_verifier_cookie(config, verifier));
+    }
+}
+
+fn redirect_after_failure(config: &Config, message: &str) -> Result<HttpResponse, AppError> {
+    let mut response = HttpResponse::Found();
+    for cookie in expired_oauth_cookies(config) {
+        response.cookie(cookie);
+    }
+    let redirect = format!(
+        "{}?auth_error={}",
+        config.commenter_redirect(),
+        urlencode(message)
+    );
+    response.insert_header((header::LOCATION, redirect.as_str()));
+    Ok(response.finish())
+}
+
+async fn exchange_google(
+    config: &Config,
+    code: &str,
+    verifier: Option<&str>,
+) -> Result<String, AppError> {
+    let (client_id, client_secret) = config
+        .oauth_provider("google")
+        .ok_or_else(|| oauth_unavailable("google"))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|err| AppError::Internal(err.to_string()))?;
+    let mut form = vec![
+        ("code", code.to_owned()),
+        ("client_id", client_id.to_owned()),
+        ("client_secret", client_secret.to_owned()),
+        ("redirect_uri", config.oauth_redirect_uri("google")),
+        ("grant_type", "authorization_code".to_owned()),
+    ];
+    if let Some(verifier) = verifier {
+        form.push(("code_verifier", verifier.to_owned()));
+    }
+    let response = client
+        .post(GOOGLE_TOKEN_URL)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|err| AppError::Internal(format!("google token request failed: {err}")))?;
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|err| AppError::Internal(format!("google token response invalid: {err}")))?;
+    body.get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::Internal("google token response missing access_token".to_owned()))
+}
+
+async fn fetch_google_profile(access_token: &str) -> Result<OAuthProfile, AppError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|err| AppError::Internal(err.to_string()))?;
+    let profile: Value = client
+        .get(GOOGLE_USERINFO_URL)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|err| AppError::Internal(format!("google profile request failed: {err}")))?
+        .error_for_status()
+        .map_err(|err| AppError::Internal(format!("google profile rejected: {err}")))?
+        .json()
+        .await
+        .map_err(|err| AppError::Internal(format!("google profile invalid: {err}")))?;
+    if profile["email_verified"] != true {
+        return Err(AppError::Unauthorized(
+            "Google email is not verified".to_owned(),
+        ));
+    }
+    Ok(OAuthProfile {
+        subject: json_string(&profile, "sub")
+            .ok_or_else(|| AppError::Internal("google profile missing subject".to_owned()))?,
+        email: json_string(&profile, "email").unwrap_or_default(),
+        name: json_string(&profile, "name").unwrap_or_default(),
+        avatar_url: json_string(&profile, "picture"),
+    })
+}
+
+async fn exchange_github(config: &Config, code: &str, verifier: &str) -> Result<String, AppError> {
+    let (client_id, client_secret) = config
+        .oauth_provider("github")
+        .ok_or_else(|| oauth_unavailable("github"))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|err| AppError::Internal(err.to_string()))?;
+    let response = client
+        .post(GITHUB_TOKEN_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", config.oauth_redirect_uri("github").as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|err| AppError::Internal(format!("github token request failed: {err}")))?;
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|err| AppError::Internal(format!("github token response invalid: {err}")))?;
+    body.get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::Internal("github token response missing access_token".to_owned()))
+}
+
+async fn fetch_github_profile(access_token: &str) -> Result<OAuthProfile, AppError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|err| AppError::Internal(err.to_string()))?;
+    let profile: Value = client
+        .get(GITHUB_USER_URL)
+        .bearer_auth(access_token)
+        .header(reqwest::header::USER_AGENT, "voidreg-api")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|err| AppError::Internal(format!("github profile request failed: {err}")))?
+        .error_for_status()
+        .map_err(|err| AppError::Internal(format!("github profile rejected: {err}")))?
+        .json()
+        .await
+        .map_err(|err| AppError::Internal(format!("github profile invalid: {err}")))?;
+
+    let subject = profile
+        .get("id")
+        .and_then(Value::as_u64)
+        .map(|id| id.to_string())
+        .ok_or_else(|| AppError::Internal("github profile missing subject".to_owned()))?;
+    let mut email = json_string(&profile, "email").unwrap_or_default();
+    if email.is_empty() {
+        let emails: Value = client
+            .get(GITHUB_EMAILS_URL)
+            .bearer_auth(access_token)
+            .header(reqwest::header::USER_AGENT, "voidreg-api")
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|err| AppError::Internal(format!("github emails request failed: {err}")))?
+            .error_for_status()
+            .map_err(|err| AppError::Internal(format!("github emails rejected: {err}")))?
+            .json()
+            .await
+            .map_err(|err| AppError::Internal(format!("github emails invalid: {err}")))?;
+        email = emails
+            .as_array()
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry
+                        .get("primary")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+            })
+            .and_then(|entry| entry.get("email").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_owned();
+    }
+
+    Ok(OAuthProfile {
+        subject,
+        email,
+        name: json_string(&profile, "name")
+            .or_else(|| json_string(&profile, "login"))
+            .unwrap_or_else(|| "GitHub user".to_owned()),
+        avatar_url: json_string(&profile, "avatar_url"),
+    })
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|v| !v.is_empty())
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn urlencode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get, path = "/api/v1/auth/providers", tag = "auth",
+    responses((status = 200, description = "Configured commenter providers", body = Vec<String>))
+))]
+#[get("/auth/providers")]
+pub async fn providers(config: web::Data<Config>) -> HttpResponse {
+    let available: Vec<&str> = ["google", "github"]
+        .into_iter()
+        .filter(|provider| config.oauth_provider(provider).is_some())
+        .collect();
+    HttpResponse::Ok().json(available)
+}

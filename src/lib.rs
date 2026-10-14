@@ -36,10 +36,13 @@ pub async fn run(workers: usize) -> io::Result<()> {
         "starting voidreg-api"
     );
 
-    let server = actix_web::HttpServer::new(move || build(db.clone(), config.clone()))
-        .workers(workers)
-        .bind(&bind)?
-        .run();
+    let limiter = actix_web::web::Data::new(crate::auth::rate::RateLimiter::new());
+    let server = actix_web::HttpServer::new(move || {
+        build(db.clone(), config.clone()).app_data(limiter.clone())
+    })
+    .workers(workers)
+    .bind(&bind)?
+    .run();
 
     let handle = server.handle();
     tokio::spawn(async move {
@@ -80,6 +83,7 @@ async fn shutdown_signal() {
 
 pub mod api;
 pub mod app;
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod domain;
@@ -88,3 +92,4 @@ pub mod mail;
 #[cfg(feature = "swagger")]
 pub mod openapi;
 pub mod telemetry;
+pub mod util;
