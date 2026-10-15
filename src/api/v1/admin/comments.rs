@@ -68,7 +68,15 @@ pub async fn list_comments(
                 .map(|identity| identity.email),
             None => None,
         };
+        let parent = match &comment.parent_id {
+            Some(id) => db.get_comment(id).await?,
+            None => None,
+        };
         items.push(CommentAdminView {
+            parent_id: comment.parent_id.clone(),
+            thread_id: comment.thread_id.clone(),
+            parent_author: parent.as_ref().map(|c| c.author_name.clone()),
+            parent_body: parent.map(|c| c.body),
             id: comment.id,
             article_slug: comment.article_slug,
             author_name: comment.author_name,
@@ -111,6 +119,11 @@ pub async fn approve_comment(
         .get_comment(&id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("comment '{id}' not found")))?;
+    if comment.status == "removed" {
+        return Err(AppError::Unprocessable(
+            "removed comments cannot be approved".to_owned(),
+        ));
+    }
     db.approve_comment(&id).await?;
     Ok(HttpResponse::Ok().json(CommentMutationResponse {
         id: comment.id,

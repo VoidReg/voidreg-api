@@ -30,6 +30,7 @@ const GITHUB_EMAILS_URL: &str = "https://api.github.com/user/emails";
 #[derive(Debug, Deserialize, Default)]
 pub struct OAuthStartQuery {
     pub purpose: Option<String>,
+    pub return_to: Option<String>,
 }
 
 #[cfg_attr(feature = "swagger", utoipa::path(
@@ -38,7 +39,8 @@ pub struct OAuthStartQuery {
     tag = "auth",
     params(
         ("provider" = String, Path, description = "google or github"),
-        ("purpose" = Option<String>, Query, description = "admin or commenter, default commenter")
+        ("purpose" = Option<String>, Query, description = "admin or commenter, default commenter"),
+        ("return_to" = Option<String>, Query, description = "Local /blog/{slug} path for commenter sign-in")
     ),
     responses(
         (status = 302, description = "Redirect to the provider"),
@@ -60,7 +62,18 @@ pub async fn start(
     if !matches!(purpose, "admin" | "commenter") {
         return Err(AppError::BadRequest("invalid sign-in purpose".to_owned()));
     }
-    let state = format!("{provider}:{purpose}:{}", crate::util::random_token());
+    let return_to = query
+        .return_to
+        .as_deref()
+        .filter(|_| purpose == "commenter");
+    if return_to.is_some_and(|path| !safe_article_return(path)) {
+        return Err(AppError::BadRequest("invalid return location".to_owned()));
+    }
+    let state = format!(
+        "{provider}:{purpose}:{}:{}",
+        crate::util::random_token(),
+        URL_SAFE_NO_PAD.encode(return_to.unwrap_or_default())
+    );
     let mut response = HttpResponse::Found();
     response.insert_header((header::CACHE_CONTROL, "no-store"));
     response.insert_header((header::REFERRER_POLICY, "no-referrer"));
@@ -180,7 +193,34 @@ pub async fn callback(
         other => return Err(oauth_unavailable(other)),
     };
 
-    finish_sign_in(&db, &config, &provider, purpose, profile).await
+    let return_to = expected_state
+        .split(':')
+        .nth(3)
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+        .and_then(|value| String::from_utf8(value).ok())
+        .filter(|path| safe_article_return(path));
+    let mut response = finish_sign_in(&db, &config, &provider, purpose, profile).await?;
+    if purpose == "commenter"
+        && let Some(path) = return_to
+    {
+        let location = format!("{}{path}", config.public_base_url);
+        response.headers_mut().insert(
+            header::LOCATION,
+            location
+                .parse()
+                .map_err(|_| AppError::BadRequest("invalid return location".to_owned()))?,
+        );
+    }
+    Ok(response)
+}
+
+fn safe_article_return(path: &str) -> bool {
+    path.starts_with("/blog/")
+        && path.len() <= 512
+        && !path.contains(['\\', '\r', '\n'])
+        && !path.contains("//")
+        && !path.contains("..")
+        && !path.contains('%')
 }
 
 async fn finish_sign_in(

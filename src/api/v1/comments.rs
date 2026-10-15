@@ -35,7 +35,7 @@ pub struct CommentListQuery {
         CommentListQuery
     ),
     responses(
-        (status = 200, description = "Approved comments", body = CommentListResponse),
+        (status = 200, description = "Visible discussion threads", body = CommentListResponse),
         (status = 404, description = "Blog not found", body = crate::error::ErrorBody)
     )
 ))]
@@ -51,23 +51,95 @@ pub async fn list_comments(
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).clamp(1, 50);
-    let (comments, total) = db.list_public_comments(&slug, page, per_page).await?;
-    let items = comments
-        .into_iter()
-        .map(|comment| CommentPublic {
-            id: comment.id,
-            author_name: comment.author_name,
-            body: comment.body,
-            created_at: comment.created_at,
-            verified: comment.identity_id.is_some(),
-        })
+    let comments = db.public_discussion(&slug).await?;
+    let roots: Vec<_> = comments
+        .iter()
+        .rev()
+        .filter(|c| c.parent_id.is_none())
         .collect();
-    Ok(HttpResponse::Ok().json(CommentListResponse {
-        items,
-        page,
-        per_page,
-        total,
-    }))
+    let total = roots.len() as i64;
+    let start = page.saturating_sub(1).saturating_mul(per_page) as usize;
+    let items = roots
+        .into_iter()
+        .skip(start)
+        .take(per_page as usize)
+        .map(|comment| public_comment(comment, &comments))
+        .collect();
+    Ok(HttpResponse::Ok()
+        .insert_header(("Cache-Control", "no-store"))
+        .json(CommentListResponse {
+            items,
+            page,
+            per_page,
+            total,
+        }))
+}
+
+fn public_comment(
+    comment: &crate::db::CommentInfo,
+    all: &[crate::db::CommentInfo],
+) -> CommentPublic {
+    CommentPublic {
+        id: comment.id.clone(),
+        parent_id: comment.parent_id.clone(),
+        thread_id: comment.thread_id.clone(),
+        replying_to: comment
+            .parent_id
+            .as_ref()
+            .and_then(|id| all.iter().find(|c| &c.id == id))
+            .map(|c| c.author_name.clone()),
+        reply_count: all
+            .iter()
+            .filter(|c| c.thread_id.as_deref() == Some(&comment.id))
+            .count() as i64,
+        removed: comment.status == "removed",
+        author_name: comment.author_name.clone(),
+        body: comment.body.clone(),
+        created_at: comment.created_at.clone(),
+        verified: comment.identity_id.is_some(),
+    }
+}
+
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get, path = "/api/v1/blogs/{slug}/comments/{id}/replies", tag = "comments",
+    params(("slug" = String, Path), ("id" = String, Path), CommentListQuery),
+    responses((status = 200, description = "Replies in chronological order", body = CommentListResponse))
+))]
+#[get("/blogs/{slug}/comments/{id}/replies")]
+pub async fn list_replies(
+    db: web::Data<Db>,
+    path: web::Path<(String, String)>,
+    query: web::Query<CommentListQuery>,
+) -> Result<HttpResponse, AppError> {
+    let (slug, id) = path.into_inner();
+    db.get_published_article(&slug).await?;
+    let comments = db.public_discussion(&slug).await?;
+    let root = comments
+        .iter()
+        .find(|c| c.id == id && c.parent_id.is_none())
+        .ok_or_else(|| AppError::NotFound("discussion not found".to_owned()))?;
+    let replies: Vec<_> = comments
+        .iter()
+        .filter(|c| c.thread_id.as_deref() == Some(&root.id))
+        .collect();
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(20).clamp(1, 50);
+    let total = replies.len() as i64;
+    let start = page.saturating_sub(1).saturating_mul(per_page) as usize;
+    let items = replies
+        .into_iter()
+        .skip(start)
+        .take(per_page as usize)
+        .map(|c| public_comment(c, &comments))
+        .collect();
+    Ok(HttpResponse::Ok()
+        .insert_header(("Cache-Control", "no-store"))
+        .json(CommentListResponse {
+            items,
+            page,
+            per_page,
+            total,
+        }))
 }
 
 #[cfg_attr(feature = "swagger", utoipa::path(
@@ -139,19 +211,44 @@ pub async fn create_comment(
         }));
     }
 
+    let parent = if let Some(id) = &payload.parent_id {
+        let parent = db
+            .get_comment(id)
+            .await?
+            .filter(|c| c.article_slug == slug && c.status == "approved")
+            .ok_or_else(|| AppError::Unprocessable("reply target is unavailable".to_owned()))?;
+        Some(parent)
+    } else {
+        None
+    };
+    let thread_id = parent
+        .as_ref()
+        .map(|p| p.thread_id.as_deref().unwrap_or(&p.id));
     let ip_hash = comment_ip_hash(&config, &request);
 
     // Rate limits run before the write; verified identities are still
     // throttled to keep a compromised session from flooding.
     let window = std::time::Duration::from_secs(RATE_WINDOW_MINUTES * 60);
-    if !limiter.check(&format!("comments:{ip_hash}"), PER_IP_MAX_COMMENTS, window) {
+    if !limiter.check(
+        &format!("comments:{ip_hash}"),
+        if commenter.identity.is_some() {
+            60
+        } else {
+            PER_IP_MAX_COMMENTS
+        },
+        window,
+    ) {
         return Err(AppError::TooManyRequests(
             "too many comments from this address; try again later".to_owned(),
         ));
     }
     if !limiter.check(
         &format!("comments:{ip_hash}:{slug}"),
-        PER_IP_MAX_PER_ARTICLE,
+        if commenter.identity.is_some() {
+            30
+        } else {
+            PER_IP_MAX_PER_ARTICLE
+        },
         window,
     ) {
         return Err(AppError::TooManyRequests(
@@ -172,7 +269,16 @@ pub async fn create_comment(
         .map(|identity| identity.id.clone());
 
     let comment = db
-        .insert_comment(&slug, identity_id.as_deref(), name, body, status, &ip_hash)
+        .insert_comment(crate::db::NewComment {
+            article_slug: &slug,
+            identity_id: identity_id.as_deref(),
+            author_name: name,
+            body,
+            status,
+            ip_hash: &ip_hash,
+            parent_id: payload.parent_id.as_deref(),
+            thread_id,
+        })
         .await?;
 
     Ok(HttpResponse::Accepted().json(CommentCreateResponse {

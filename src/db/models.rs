@@ -61,6 +61,8 @@ pub struct NewsletterSubscriber {
 
 #[derive(Debug, toasty::Model)]
 pub struct Comment {
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
     #[key]
     #[auto]
     pub id: uuid::Uuid,

@@ -88,3 +88,28 @@ covers migration reruns, authentication, CSRF, draft isolation, publication,
 conditional reads, sitemap, pagination, stale compilation, legacy conversion,
 moderation, logout, and OAuth start/state validation. No live data is migrated
 by the tests.
+
+## Discussion threads
+
+Comments can include `parent_id` to reply to an approved comment on the same
+published article. The server determines the root `thread_id`; clients cannot
+choose it. Replies to replies retain their exact parent. Root threads paginate
+through `GET /api/v1/blogs/{slug}/comments`; `total` counts roots and each item
+includes `reply_count`. Fetch chronological, separately paginated replies with
+`GET /api/v1/blogs/{slug}/comments/{root_id}/replies`. Public responses include
+parent IDs, replying-to names, and removed placeholders where needed. Pending
+contributions remain private. Discussion reads use no-store.
+
+Deletion clears the comment body, author name, and identity link, retaining a
+removed ancestor only while approved descendants need it. Replies to removed,
+pending, missing, or cross-article targets are rejected. Removed comments cannot
+be reapproved. The moderation queue includes parent author/body context.
+
+Anonymous limits remain five contributions per address per hour and two per
+article. Signed-in commenters can contribute sixty per address per hour and
+thirty per article, allowing normal conversations while retaining throttling.
+OAuth commenter return locations are restricted to local article paths and
+bound into the checked state; admin redirects remain fixed.
+
+Migration adds nullable parent/thread columns, so existing comments become
+top-level threads without content changes. Back up before rollout.

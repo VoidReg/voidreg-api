@@ -16,6 +16,7 @@ pub fn configure(cfg: &mut ServiceConfig) {
         .service(blogs::list_blogs)
         .service(blogs::get_blog)
         .service(comments::list_comments)
+        .service(comments::list_replies)
         .service(comments::create_comment)
         .service(contact::create_contact)
         .service(newsletter::subscribe)

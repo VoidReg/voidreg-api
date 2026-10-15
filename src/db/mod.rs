@@ -54,6 +54,8 @@ pub struct IdentityInfo {
 
 #[derive(Debug, Clone)]
 pub struct CommentInfo {
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
     pub id: String,
     pub article_slug: String,
     pub identity_id: Option<String>,
@@ -62,6 +64,17 @@ pub struct CommentInfo {
     pub status: String,
     pub created_at: String,
     pub email: Option<String>,
+}
+
+pub struct NewComment<'a> {
+    pub article_slug: &'a str,
+    pub identity_id: Option<&'a str>,
+    pub author_name: &'a str,
+    pub body: &'a str,
+    pub status: &'a str,
+    pub ip_hash: &'a str,
+    pub parent_id: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
 }
 
 impl Db {
@@ -315,18 +328,22 @@ impl Db {
 
     // Comments
 
-    pub async fn insert_comment(
-        &self,
-        article_slug: &str,
-        identity_id: Option<&str>,
-        author_name: &str,
-        body: &str,
-        status: &str,
-        ip_hash: &str,
-    ) -> Result<CommentInfo, AppError> {
+    pub async fn insert_comment(&self, input: NewComment<'_>) -> Result<CommentInfo, AppError> {
+        let NewComment {
+            article_slug,
+            identity_id,
+            author_name,
+            body,
+            status,
+            ip_hash,
+            parent_id,
+            thread_id,
+        } = input;
         let mut db = self.inner.lock().await;
         let created_at = now_rfc3339();
         let row = toasty::create!(models::Comment {
+            parent_id: parent_id.map(str::to_owned),
+            thread_id: thread_id.map(str::to_owned),
             article_slug: article_slug.to_owned(),
             identity_id: identity_id.map(str::to_owned),
             author_name: author_name.to_owned(),
@@ -340,31 +357,41 @@ impl Db {
         Ok(comment_from_row(row))
     }
 
-    /// Approved comments for an article, newest first. Pagination is applied
-    /// in memory; comment volume is small at this site's scale.
-    pub async fn list_public_comments(
+    /// Visible discussion entries, including removed ancestors of approved replies.
+    pub async fn public_discussion(
         &self,
         article_slug: &str,
-        page: i64,
-        per_page: i64,
-    ) -> Result<(Vec<CommentInfo>, i64), AppError> {
+    ) -> Result<Vec<CommentInfo>, AppError> {
         let mut db = self.inner.lock().await;
-        let rows = models::Comment::filter(toasty::stmt::Expr::and(
-            models::Comment::fields().article_slug().eq(article_slug),
-            models::Comment::fields().status().eq("approved"),
-        ))
-        .exec(&mut *db)
-        .await?;
-        let mut items: Vec<CommentInfo> = rows.into_iter().map(comment_from_row).collect();
-        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        let total = items.len() as i64;
-        let start = page.saturating_sub(1).saturating_mul(per_page).max(0) as usize;
-        let page_items = items
+        let rows =
+            models::Comment::filter(models::Comment::fields().article_slug().eq(article_slug))
+                .exec(&mut *db)
+                .await?;
+        let items: Vec<CommentInfo> = rows.into_iter().map(comment_from_row).collect();
+        let by_id: std::collections::HashMap<_, _> =
+            items.iter().map(|c| (c.id.as_str(), c)).collect();
+        let mut visible = std::collections::HashSet::new();
+        for comment in items.iter().filter(|c| c.status == "approved") {
+            let mut current = Some(comment);
+            while let Some(node) = current {
+                if !matches!(node.status.as_str(), "approved" | "removed") {
+                    break;
+                }
+                if !visible.insert(node.id.clone()) {
+                    break;
+                }
+                current = node
+                    .parent_id
+                    .as_deref()
+                    .and_then(|id| by_id.get(id).copied());
+            }
+        }
+        let mut items: Vec<_> = items
             .into_iter()
-            .skip(start)
-            .take(per_page.max(0) as usize)
+            .filter(|c| visible.contains(&c.id))
             .collect();
-        Ok((page_items, total))
+        items.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok(items)
     }
 
     /// All comments matching `status` (None = every status), newest first.
@@ -421,10 +448,14 @@ impl Db {
     pub async fn delete_comment(&self, id: &str) -> Result<(), AppError> {
         let mut db = self.inner.lock().await;
         let uuid = parse_uuid(id)?;
-        models::Comment::filter_by_id(uuid)
-            .delete()
-            .exec(&mut *db)
-            .await?;
+        toasty::update!(models::Comment::filter_by_id(uuid) {
+            status: "removed".to_owned(),
+            body: String::new(),
+            author_name: "Removed comment".to_owned(),
+            identity_id: None::<String>,
+        })
+        .exec(&mut *db)
+        .await?;
         Ok(())
     }
 
@@ -677,13 +708,17 @@ async fn apply_schema(db: &mut toasty::Db) -> Result<(), AppError> {
 
     // SQLite cannot add a column idempotently; tolerate duplicate-column
     // errors from databases that already carry the new articles columns.
-    for (column, statement) in ARTICLE_COLUMN_ADDITIONS.iter().copied() {
+    for (column, statement) in ARTICLE_COLUMN_ADDITIONS
+        .iter()
+        .chain(COMMENT_COLUMN_ADDITIONS)
+        .copied()
+    {
         if let Err(err) = toasty::sql::statement(statement).exec(&mut *db).await {
             let message = err.to_string();
             if !message.contains("duplicate column name") {
                 return Err(AppError::Database(message));
             }
-            tracing::debug!(column, "articles column already present");
+            tracing::debug!(column, "column already present");
         }
     }
 
@@ -715,6 +750,17 @@ const SCHEMA_STATEMENTS: &[&str] = &[
 
 /// Column additions for databases created before articles stored Publisle
 /// documents.
+const COMMENT_COLUMN_ADDITIONS: &[(&str, &str)] = &[
+    (
+        "parent_id",
+        r#"ALTER TABLE "comments" ADD COLUMN "parent_id" TEXT"#,
+    ),
+    (
+        "thread_id",
+        r#"ALTER TABLE "comments" ADD COLUMN "thread_id" TEXT"#,
+    ),
+];
+
 const ARTICLE_COLUMN_ADDITIONS: &[(&str, &str)] = &[
     (
         "document",
@@ -832,6 +878,8 @@ fn article_from_row(row: models::Article) -> Result<Article, AppError> {
 
 fn comment_from_row(row: models::Comment) -> CommentInfo {
     CommentInfo {
+        parent_id: row.parent_id,
+        thread_id: row.thread_id,
         id: row.id.to_string(),
         article_slug: row.article_slug,
         identity_id: row.identity_id,

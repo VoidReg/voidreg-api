@@ -26,6 +26,7 @@ use crate::error::{ErrorBody, ErrorDetail};
         v1::blogs::list_blogs,
         v1::blogs::get_blog,
         v1::comments::list_comments,
+        v1::comments::list_replies,
         v1::comments::create_comment,
         v1::contact::create_contact,
         v1::newsletter::subscribe,

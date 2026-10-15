@@ -12,6 +12,11 @@ pub struct CommentCreateResponse {
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct CommentPublic {
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub replying_to: Option<String>,
+    pub reply_count: i64,
+    pub removed: bool,
     pub id: String,
     pub author_name: String,
     pub body: String,
@@ -32,6 +37,8 @@ pub struct CommentListResponse {
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct CommentCreateRequest {
+    #[serde(default)]
+    pub parent_id: Option<String>,
     pub name: String,
     pub body: String,
     /// Optional legacy input, validated but not retained.
@@ -46,6 +53,10 @@ pub struct CommentCreateRequest {
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct CommentAdminView {
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub parent_author: Option<String>,
+    pub parent_body: Option<String>,
     pub id: String,
     pub article_slug: String,
     pub author_name: String,
