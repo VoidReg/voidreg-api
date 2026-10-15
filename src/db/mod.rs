@@ -539,6 +539,19 @@ impl Db {
         }))
     }
 
+    /// Resolve the provider's immutable subject for admin authorization.
+    pub async fn identity_subject(&self, id: &str) -> Result<Option<(String, String)>, AppError> {
+        let mut db = self.inner.lock().await;
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Ok(None);
+        };
+        let row = models::Identity::filter_by_id(uuid)
+            .first()
+            .exec(&mut *db)
+            .await?;
+        Ok(row.map(|row| (row.provider, row.subject)))
+    }
+
     // Sessions
 
     pub async fn create_session(

@@ -36,8 +36,7 @@ pub async fn login(
 ) -> Result<HttpResponse, AppError> {
     if !config.admin_auth_configured() {
         return Err(AppError::ServiceUnavailable(
-            "admin authentication is not configured; set ADMIN_PASSWORD or ADMIN_PASSWORD_HASH"
-                .to_owned(),
+            "password login is disabled".to_owned(),
         ));
     }
 
@@ -119,4 +118,21 @@ pub async fn logout(
 /// CSRF value bound to an admin session token.
 pub fn csrf_for(token: &str) -> String {
     hash_token(&format!("csrf:{token}"))
+}
+
+/// Login options are public; account allowlists and credentials are never exposed.
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get, path = "/api/v1/admin/login-options", tag = "admin",
+    responses((status = 200, description = "Available admin sign-in methods", body = serde_json::Value))
+))]
+#[get("/login-options")]
+pub async fn login_options(config: web::Data<Config>) -> HttpResponse {
+    let providers: Vec<&str> = ["github", "google"]
+        .into_iter()
+        .filter(|provider| config.oauth_provider(provider).is_some())
+        .collect();
+    HttpResponse::Ok().json(serde_json::json!({
+        "providers": providers,
+        "password_enabled": config.admin_auth_configured()
+    }))
 }

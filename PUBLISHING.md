@@ -5,16 +5,39 @@ columns with defaults, comments, identities, and sessions without dropping exist
 tables. `cargo migrate -- --seed` also inserts seed drafts when empty. Migration
 can be rerun safely. Back up the database before deploying schema changes.
 
-Configure `ADMIN_PASSWORD_HASH` with an Argon2 PHC hash for deployment.
-`ADMIN_PASSWORD` is a local development fallback. `PUBLIC_BASE_URL` is the public
-site origin, not the container address. Set a private `COMMENT_IP_SALT`.
-Use explicit `CORS_ORIGINS` for credentialed development requests.
+Admin sign-in uses GitHub or Google OAuth. Configure the provider client ID and
+secret, then set `ADMIN_GITHUB_IDS` to comma-separated numeric GitHub user IDs
+and/or `ADMIN_GOOGLE_SUBJECTS` to Google's immutable `sub` values. Empty lists
+deny all accounts. Usernames and email addresses never grant admin access.
+Google profiles must have a verified email before their subject is considered.
+Use your approved Google account on its first sign-in; the rejection page shows
+its account ID for explicit owner approval. Add that subject and sign in again.
 
-Admin routes live at `/api/v1/admin`. Login at `POST /session` with
-`{"password":"..."}`. Subsequent requests send the session cookie. Unsafe admin
-requests must send `X-CSRF-Token` equal to the readable `voidreg_admin_csrf` cookie.
-`GET /session` restores a session; `DELETE /session` revokes it. Admin responses
-carry `Cache-Control: no-store`. HTTPS public origins enable Secure cookies.
+Register callbacks at `https://www.voidreg.xyz/api/v1/auth/github/callback` and
+`https://www.voidreg.xyz/api/v1/auth/google/callback` for production. Set
+`PUBLIC_BASE_URL=https://www.voidreg.xyz`. The admin button starts OAuth with
+`purpose=admin`; the purpose and provider are bound into the checked state.
+Commenter sign-in never promotes a session, even for an allowlisted owner.
+Every admin request rechecks the current account allowlist. Removing an ID and
+restarting the service immediately denies its existing sessions.
+
+`GET /api/v1/admin/login-options` exposes configured providers and whether local
+password login is enabled, without exposing credentials or allowlists. Admin
+OAuth creates a separate HttpOnly session cookie and a session-bound CSRF token.
+Unsafe admin requests send `X-CSRF-Token` from the `voidreg_admin_csrf` cookie.
+`GET /api/v1/admin/session` restores a session; `DELETE` revokes it. Admin
+responses carry `Cache-Control: no-store`. HTTPS origins enable Secure cookies.
+
+Password login is disabled unless `ADMIN_PASSWORD_ENABLED=true`. It remains
+available for explicit local development with `ADMIN_PASSWORD` or an Argon2
+`ADMIN_PASSWORD_HASH`. Single-quote PHC hashes in Compose env files to preserve
+dollar signs. Disabling password login also rejects existing password sessions.
+Do not remove the working production login until OAuth credentials, allowlists,
+and an owner sign-in have been verified. Then disable the flag and remove the
+password/hash from production configuration.
+
+Set a private `COMMENT_IP_SALT`. Use explicit `CORS_ORIGINS` including your
+primary site origin for credentialed requests.
 
 Article CRUD uses `/articles` and `/articles/{slug}`. Slugs are immutable.
 `POST /articles/{slug}/publish` and `/unpublish` change visibility. Public queries

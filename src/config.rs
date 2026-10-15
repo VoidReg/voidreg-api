@@ -13,6 +13,9 @@ pub struct Config {
     pub resend_domain: String,
     pub resend_from_user: String,
     pub contact_to_email: String,
+    pub admin_password_enabled: bool,
+    pub admin_github_ids: Vec<String>,
+    pub admin_google_subjects: Vec<String>,
     pub admin_password: Option<String>,
     pub admin_password_hash: Option<String>,
     pub admin_session_ttl_hours: i64,
@@ -40,6 +43,16 @@ fn optional_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn env_list(key: &str) -> Vec<String> {
+    env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 impl Config {
@@ -91,6 +104,9 @@ impl Config {
             resend_domain,
             resend_from_user,
             contact_to_email,
+            admin_password_enabled: env::var("ADMIN_PASSWORD_ENABLED").is_ok_and(|v| v == "true"),
+            admin_github_ids: env_list("ADMIN_GITHUB_IDS"),
+            admin_google_subjects: env_list("ADMIN_GOOGLE_SUBJECTS"),
             admin_password: optional_env("ADMIN_PASSWORD"),
             admin_password_hash: optional_env("ADMIN_PASSWORD_HASH"),
             admin_session_ttl_hours,
@@ -116,6 +132,9 @@ impl Config {
             resend_domain: "mail.example.com".to_owned(),
             resend_from_user: "form".to_owned(),
             contact_to_email: "admin@example.com".to_owned(),
+            admin_password_enabled: true,
+            admin_github_ids: vec![],
+            admin_google_subjects: vec![],
             admin_password: Some("voidreg-test-admin".to_owned()),
             admin_password_hash: None,
             admin_session_ttl_hours: 72,
@@ -138,7 +157,17 @@ impl Config {
     }
 
     pub fn admin_auth_configured(&self) -> bool {
-        self.admin_password.is_some() || self.admin_password_hash.is_some()
+        self.admin_password_enabled
+            && (self.admin_password.is_some() || self.admin_password_hash.is_some())
+    }
+
+    pub fn admin_identity_allowed(&self, provider: &str, subject: &str) -> bool {
+        let allowed = match provider {
+            "github" => &self.admin_github_ids,
+            "google" => &self.admin_google_subjects,
+            _ => return false,
+        };
+        !subject.is_empty() && allowed.iter().any(|id| id == subject)
     }
 
     pub fn oauth_provider(&self, provider: &str) -> Option<(&str, &str)> {

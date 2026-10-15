@@ -20,6 +20,7 @@ use crate::error::AppError;
 /// unsafe methods pass the CSRF double-submit check here.
 pub struct AdminSession {
     pub token: String,
+    config: crate::config::Config,
 }
 
 impl FromRequest for AdminSession {
@@ -35,7 +36,12 @@ fn from_request_admin(request: &HttpRequest) -> Result<AdminSession, AppError> {
     let token = cookie_token(request, ADMIN_SESSION_COOKIE)
         .ok_or_else(|| AppError::Unauthorized("admin authentication required".to_owned()))?;
     csrf_check(request)?;
-    Ok(AdminSession { token })
+    let config = request
+        .app_data::<Data<crate::config::Config>>()
+        .ok_or_else(|| AppError::Internal("missing authentication configuration".to_owned()))?
+        .get_ref()
+        .clone();
+    Ok(AdminSession { token, config })
 }
 
 impl AdminSession {
@@ -47,6 +53,24 @@ impl AdminSession {
             .ok_or_else(|| AppError::Unauthorized("admin session expired".to_owned()))?;
         if session.kind != SESSION_KIND_ADMIN {
             return Err(AppError::Unauthorized("admin session required".to_owned()));
+        }
+        match session.identity_id {
+            Some(id) => {
+                let (provider, subject) = db.identity_subject(&id).await?.ok_or_else(|| {
+                    AppError::Unauthorized("admin identity no longer exists".to_owned())
+                })?;
+                if !self.config.admin_identity_allowed(&provider, &subject) {
+                    return Err(AppError::Forbidden(
+                        "admin access is not allowed for this account".to_owned(),
+                    ));
+                }
+            }
+            None if !self.config.admin_auth_configured() => {
+                return Err(AppError::Unauthorized(
+                    "password sessions are disabled".to_owned(),
+                ));
+            }
+            None => {}
         }
         Ok(())
     }

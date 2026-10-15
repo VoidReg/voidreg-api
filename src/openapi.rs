@@ -34,6 +34,7 @@ use crate::error::{ErrorBody, ErrorDetail};
         v1::auth::callback,
         v1::auth::show_session,
         v1::auth::clear_session,
+        v1::admin::session::login_options,
         v1::admin::session::login,
         v1::admin::session::show,
         v1::admin::session::logout,
@@ -81,7 +82,7 @@ use crate::error::{ErrorBody, ErrorDetail};
         (name = "projects", description = "Portfolio projects"),
         (name = "blogs", description = "Published engineering notes"),
         (name = "comments", description = "Reader comments"),
-        (name = "auth", description = "Commenter OAuth identity"),
+        (name = "auth", description = "Admin and commenter OAuth identity"),
         (name = "admin", description = "Admin publishing and moderation"),
         (name = "contact", description = "Contact form"),
         (name = "newsletter", description = "Newsletter subscriptions")

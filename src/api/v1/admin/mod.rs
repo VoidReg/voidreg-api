@@ -5,7 +5,8 @@ pub mod comments;
 pub mod session;
 
 pub fn configure(cfg: &mut ServiceConfig) {
-    cfg.service(session::login)
+    cfg.service(session::login_options)
+        .service(session::login)
         .service(session::show)
         .service(session::logout)
         .service(articles::list_articles)
