@@ -39,6 +39,7 @@ pub struct AdminLoginRequest {
 #[derive(Debug, Default, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct ArticleWriteRequest {
+    pub expected_revision: Option<i64>,
     #[serde(default)]
     pub slug: Option<String>,
     #[serde(default)]
@@ -67,6 +68,7 @@ pub struct ArticleWriteRequest {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct ArticleMutationResponse {
+    pub revision: i64,
     pub slug: String,
     pub status: String,
     pub content_hash: String,

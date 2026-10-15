@@ -19,6 +19,7 @@ pub struct Db {
 /// Full set of stored fields for an article, used by insert and save.
 #[derive(Debug, Clone)]
 pub struct ArticleFields {
+    pub revision: i64,
     pub slug: String,
     pub title: String,
     pub category: String,
@@ -218,6 +219,7 @@ impl Db {
     pub async fn insert_article(&self, fields: ArticleFields) -> Result<Article, AppError> {
         let mut db = self.inner.lock().await;
         let row = toasty::create!(models::Article {
+            revision: 1,
             slug: fields.slug,
             title: fields.title,
             category: fields.category,
@@ -240,9 +242,24 @@ impl Db {
 
     /// Saves every writable field of an article identified by its (current)
     /// slug.
-    pub async fn save_article(&self, fields: &ArticleFields) -> Result<Article, AppError> {
+    pub async fn save_article(
+        &self,
+        fields: &ArticleFields,
+        draft_only: bool,
+    ) -> Result<Article, AppError> {
         let mut db = self.inner.lock().await;
-        let slug = fields.slug.clone();
+        // Compare and update in the same SQL statement. A concurrent publish
+        // cannot turn an MCP draft write into a live article edit.
+        let mut predicate = toasty::stmt::Expr::and(
+            models::Article::fields().slug().eq(fields.slug.clone()),
+            models::Article::fields().revision().eq(fields.revision),
+        );
+        if draft_only {
+            predicate =
+                toasty::stmt::Expr::and(predicate, models::Article::fields().status().eq("draft"));
+        }
+        let query = models::Article::filter(predicate);
+        let revision = fields.revision + 1;
         let title = fields.title.clone();
         let category = fields.category.clone();
         let summary = fields.summary.clone();
@@ -256,7 +273,8 @@ impl Db {
         let document_version = fields.document_version;
         let compiled = fields.compiled.clone();
         let content_hash = fields.content_hash.clone();
-        toasty::update!(models::Article::filter_by_slug(slug) {
+        let update = toasty::update!(query {
+            revision,
             title,
             category,
             summary,
@@ -270,20 +288,35 @@ impl Db {
             document_version,
             compiled,
             content_hash,
-        })
-        .exec(&mut *db)
-        .await?;
-        let slug = fields.slug.clone();
-        let row = models::Article::filter_by_slug(slug)
-            .first()
-            .exec(&mut *db)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("article '{}' not found", fields.slug)))?;
+        });
+        // The generated builder discards query results. Ask the typed statement
+        // for full updated rows so a failed compare-and-swap is unambiguous.
+        let mut statement = toasty::stmt::IntoStatement::into_statement(update).into_untyped();
+        if let toasty_core::stmt::Statement::Update(update) = &mut statement {
+            update.returning = Some(toasty_core::stmt::Returning::Model { include: vec![] });
+        }
+        let mut updated =
+            toasty::Statement::<toasty::stmt::List<models::Article>>::from_untyped_stmt(statement)
+                .exec(&mut *db)
+                .await?;
+        let row = updated
+            .pop()
+            .ok_or_else(|| AppError::Conflict("article changed; reload before saving".into()))?;
         article_from_row(row)
     }
 
-    pub async fn delete_article(&self, slug: &str) -> Result<(), AppError> {
+    pub async fn delete_article(&self, slug: &str, expected_revision: i64) -> Result<(), AppError> {
         let mut db = self.inner.lock().await;
+        let current = models::Article::filter_by_slug(slug)
+            .first()
+            .exec(&mut *db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("article not found".into()))?;
+        if current.revision != expected_revision {
+            return Err(AppError::Conflict(
+                "article changed; reload before deleting".into(),
+            ));
+        }
         models::Article::filter_by_slug(slug)
             .delete()
             .exec(&mut *db)
@@ -583,6 +616,67 @@ impl Db {
         Ok(row.map(|row| (row.provider, row.subject)))
     }
 
+    pub async fn create_mcp_token(
+        &self,
+        identity_id: &str,
+        name: &str,
+        hash: &str,
+        ttl_hours: i64,
+    ) -> Result<McpTokenInfo, AppError> {
+        let mut db = self.inner.lock().await;
+        let row = toasty::create!(models::McpToken {
+            token_hash: hash.to_owned(),
+            identity_id: identity_id.to_owned(),
+            name: name.to_owned(),
+            created_at: now_rfc3339(),
+            expires_at: crate::util::rfc3339_plus_hours(ttl_hours),
+            last_used_at: None,
+        })
+        .exec(&mut *db)
+        .await?;
+        Ok(mcp_token_info(row))
+    }
+
+    pub async fn list_mcp_tokens(&self, identity_id: &str) -> Result<Vec<McpTokenInfo>, AppError> {
+        let mut db = self.inner.lock().await;
+        let rows =
+            models::McpToken::filter(models::McpToken::fields().identity_id().eq(identity_id))
+                .exec(&mut *db)
+                .await?;
+        Ok(rows.into_iter().map(mcp_token_info).collect())
+    }
+
+    pub async fn revoke_mcp_token(&self, id: &str, identity_id: &str) -> Result<(), AppError> {
+        let mut db = self.inner.lock().await;
+        let query = models::McpToken::filter(toasty::stmt::Expr::and(
+            models::McpToken::fields().id().eq(parse_uuid(id)?),
+            models::McpToken::fields().identity_id().eq(identity_id),
+        ));
+        query.delete().exec(&mut *db).await?;
+        Ok(())
+    }
+
+    pub async fn mcp_token_identity(&self, hash: &str) -> Result<Option<String>, AppError> {
+        let mut db = self.inner.lock().await;
+        let Some(row) = models::McpToken::filter_by_token_hash(hash)
+            .first()
+            .exec(&mut *db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.expires_at <= now_rfc3339() {
+            return Ok(None);
+        }
+        Ok(Some(row.identity_id))
+    }
+
+    pub async fn touch_mcp_token(&self, hash: &str) -> Result<(), AppError> {
+        let mut db = self.inner.lock().await;
+        toasty::update!(models::McpToken::filter_by_token_hash(hash) { last_used_at: Some(now_rfc3339()) }).exec(&mut *db).await?;
+        Ok(())
+    }
+
     // Sessions
 
     pub async fn create_session(
@@ -729,6 +823,8 @@ async fn apply_schema(db: &mut toasty::Db) -> Result<(), AppError> {
 /// databases get the full schema; existing ones only gain missing tables and
 /// indexes.
 const SCHEMA_STATEMENTS: &[&str] = &[
+    r#"CREATE TABLE IF NOT EXISTS "mcp_tokens" ("id" BLOB NOT NULL, "token_hash" TEXT NOT NULL, "identity_id" TEXT NOT NULL, "name" TEXT NOT NULL, "created_at" TEXT NOT NULL, "expires_at" TEXT NOT NULL, "last_used_at" TEXT, PRIMARY KEY ("id"))"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_mcp_tokens_by_token_hash" ON "mcp_tokens" ("token_hash")"#,
     r#"CREATE TABLE IF NOT EXISTS "projects" ("id" BLOB NOT NULL, "slug" TEXT NOT NULL, "title" TEXT NOT NULL, "category" TEXT NOT NULL, "summary" TEXT NOT NULL, "tags" TEXT NOT NULL, "sections" TEXT NOT NULL, "hero" TEXT, "has_detail_page" BOOLEAN NOT NULL, "featured" BOOLEAN NOT NULL, "sort_order" BIGINT NOT NULL, "repo_url" TEXT, "related_slugs" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
     r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_projects_by_slug" ON "projects" ("slug")"#,
     // articles: base columns shared with pre-document databases
@@ -762,6 +858,10 @@ const COMMENT_COLUMN_ADDITIONS: &[(&str, &str)] = &[
 ];
 
 const ARTICLE_COLUMN_ADDITIONS: &[(&str, &str)] = &[
+    (
+        "revision",
+        r#"ALTER TABLE "articles" ADD COLUMN "revision" BIGINT NOT NULL DEFAULT 1"#,
+    ),
     (
         "document",
         r#"ALTER TABLE "articles" ADD COLUMN "document" TEXT NOT NULL DEFAULT ''"#,
@@ -823,7 +923,8 @@ fn model_set() -> toasty::ModelSet {
         crate::db::models::NewsletterSubscriber,
         crate::db::models::Comment,
         crate::db::models::Identity,
-        crate::db::models::Session
+        crate::db::models::Session,
+        crate::db::models::McpToken
     )
 }
 
@@ -860,6 +961,7 @@ fn article_from_row(row: models::Article) -> Result<Article, AppError> {
         Some(serde_json::from_str(&row.compiled)?)
     };
     Ok(Article {
+        revision: row.revision,
         slug: row.slug,
         title: row.title,
         category: row.category,
@@ -899,5 +1001,23 @@ fn identity_from_row(row: models::Identity) -> IdentityInfo {
         email: row.email,
         name: row.name,
         avatar_url: row.avatar_url,
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct McpTokenInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub last_used_at: Option<String>,
+}
+fn mcp_token_info(row: models::McpToken) -> McpTokenInfo {
+    McpTokenInfo {
+        id: row.id.to_string(),
+        name: row.name,
+        created_at: row.created_at,
+        expires_at: row.expires_at,
+        last_used_at: row.last_used_at,
     }
 }

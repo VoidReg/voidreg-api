@@ -4680,6 +4680,7 @@ dependencies = [
  "thiserror",
  "time",
  "toasty",
+ "toasty-core",
  "toasty-driver-turso",
  "tokio",
  "toml 0.9.12+spec-1.1.0",

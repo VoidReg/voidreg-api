@@ -17,6 +17,7 @@ serde_json = "1"
 thiserror = "2"
 toml = "0.9"
 toasty = { version = "0.10", features = ["turso"] }
+toasty-core = "0.10"
 toasty-driver-turso = { version = "0.10", features = ["sync"] }
 tokio = { version = "1.53.1", features = [
     "rt-multi-thread",

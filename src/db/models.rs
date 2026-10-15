@@ -20,6 +20,7 @@ pub struct Project {
 
 #[derive(Debug, toasty::Model)]
 pub struct Article {
+    pub revision: i64,
     #[key]
     #[auto]
     pub id: uuid::Uuid,
@@ -98,4 +99,18 @@ pub struct Session {
     pub identity_id: Option<String>,
     pub created_at: String,
     pub expires_at: String,
+}
+
+#[derive(Debug, toasty::Model)]
+pub struct McpToken {
+    #[key]
+    #[auto]
+    pub id: uuid::Uuid,
+    #[unique]
+    pub token_hash: String,
+    pub identity_id: String,
+    pub name: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub last_used_at: Option<String>,
 }

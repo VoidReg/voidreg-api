@@ -30,6 +30,7 @@ impl ArticleStatus {
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct Article {
+    pub revision: i64,
     pub slug: String,
     pub title: String,
     pub category: String,

@@ -80,6 +80,7 @@ async fn publishing_lifecycle_cache_csrf_and_moderation() {
     );
     let req = test::TestRequest::post()
         .uri("/api/v1/admin/articles/test-article/publish")
+        .set_json(json!({"expected_revision":1}))
         .cookie(session.clone())
         .insert_header(("X-CSRF-Token", csrf.clone()))
         .to_request();
@@ -127,7 +128,7 @@ async fn publishing_lifecycle_cache_csrf_and_moderation() {
         .uri("/api/v1/admin/articles/test-article")
         .cookie(session.clone())
         .insert_header(("X-CSRF-Token", csrf.clone()))
-        .set_json(json!({"document":document("Edited")}))
+        .set_json(json!({"document":document("Edited"),"expected_revision":2}))
         .to_request();
     assert_eq!(
         test::call_service(&app, req).await.status(),
@@ -160,6 +161,7 @@ async fn publishing_lifecycle_cache_csrf_and_moderation() {
     assert!(body["items"][0].get("ip_hash").is_none());
     let req = test::TestRequest::post()
         .uri("/api/v1/admin/articles/test-article/unpublish")
+        .set_json(json!({"expected_revision":2}))
         .cookie(session.clone())
         .insert_header(("X-CSRF-Token", csrf.clone()))
         .to_request();
@@ -168,12 +170,13 @@ async fn publishing_lifecycle_cache_csrf_and_moderation() {
         .uri("/api/v1/admin/articles/test-article")
         .cookie(session.clone())
         .insert_header(("X-CSRF-Token", csrf.clone()))
-        .set_json(json!({"document":document("Edited")}))
+        .set_json(json!({"document":document("Edited"),"expected_revision":3}))
         .to_request();
     let body: Value = test::call_and_read_body_json(&app, req).await;
     assert!(body.get("compiled").is_none());
     let req = test::TestRequest::post()
         .uri("/api/v1/admin/articles/test-article/publish")
+        .set_json(json!({"expected_revision":4}))
         .cookie(session.clone())
         .insert_header(("X-CSRF-Token", csrf.clone()))
         .to_request();
@@ -185,7 +188,7 @@ async fn publishing_lifecycle_cache_csrf_and_moderation() {
         .uri("/api/v1/admin/articles/how-to-validate-a-semantic-color-system")
         .cookie(session.clone())
         .insert_header(("X-CSRF-Token", csrf.clone()))
-        .set_json(json!({"featured":true}))
+        .set_json(json!({"featured":true,"expected_revision":1}))
         .to_request();
     let body: Value = test::call_and_read_body_json(&app, req).await;
     assert_eq!(body["document"]["schemaVersion"], 1);

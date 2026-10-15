@@ -13,6 +13,7 @@ async fn database() -> Db {
     db.migrate().await.unwrap();
     for slug in ["discussion", "other"] {
         db.insert_article(ArticleFields {
+            revision: 1,
             slug: slug.into(),
             title: slug.into(),
             category: "Systems".into(),

@@ -57,8 +57,10 @@ pub async fn create_article(
     session: AdminSession,
 ) -> Result<HttpResponse, AppError> {
     session.validate(&db).await?;
-    let input = payload.into_inner();
+    create(&db, payload.into_inner()).await
+}
 
+pub(crate) async fn create(db: &Db, input: ArticleWriteRequest) -> Result<HttpResponse, AppError> {
     let title = required(&input.title, "title", MAX_TITLE_LEN)?;
     let category = required(&input.category, "category", MAX_CATEGORY_LEN)?;
     let summary = required(&input.summary, "summary", MAX_SUMMARY_LEN)?;
@@ -81,6 +83,7 @@ pub async fn create_article(
     let compiled_json = prepare_compiled(input.compiled.as_ref())?;
 
     let fields = ArticleFields {
+        revision: 1,
         slug,
         title,
         category,
@@ -148,9 +151,15 @@ pub async fn update_article(
     session: AdminSession,
 ) -> Result<HttpResponse, AppError> {
     session.validate(&db).await?;
-    let slug = path.into_inner();
-    let input = payload.into_inner();
+    update(&db, path.into_inner(), payload.into_inner(), false).await
+}
 
+pub(crate) async fn update(
+    db: &Db,
+    slug: String,
+    input: ArticleWriteRequest,
+    draft_only: bool,
+) -> Result<HttpResponse, AppError> {
     if let Some(requested) = input
         .slug
         .as_deref()
@@ -164,6 +173,10 @@ pub async fn update_article(
     }
 
     let mut current_fields = article_fields(db.admin_get_article(&slug).await?)?;
+    check_revision(input.expected_revision, current_fields.revision)?;
+    if draft_only && current_fields.status != "draft" {
+        return Err(AppError::Forbidden("MCP can only edit drafts".into()));
+    }
 
     if let Some(title) = &input.title {
         current_fields.title = bounded(title, "title", MAX_TITLE_LEN)?;
@@ -212,7 +225,7 @@ pub async fn update_article(
         ));
     }
     current_fields.content_hash = compute_content_hash(&current_fields);
-    let article = db.save_article(&current_fields).await?;
+    let article = db.save_article(&current_fields, draft_only).await?;
     Ok(HttpResponse::Ok().json(article))
 }
 
@@ -232,8 +245,16 @@ pub async fn publish_article(
     db: web::Data<Db>,
     path: web::Path<String>,
     session: AdminSession,
+    payload: web::Json<ArticleWriteRequest>,
 ) -> Result<HttpResponse, AppError> {
-    set_status(db, path, session, crate::domain::ArticleStatus::Published).await
+    set_status(
+        db,
+        path,
+        session,
+        payload.expected_revision,
+        crate::domain::ArticleStatus::Published,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "swagger", utoipa::path(
@@ -252,8 +273,16 @@ pub async fn unpublish_article(
     db: web::Data<Db>,
     path: web::Path<String>,
     session: AdminSession,
+    payload: web::Json<ArticleWriteRequest>,
 ) -> Result<HttpResponse, AppError> {
-    set_status(db, path, session, crate::domain::ArticleStatus::Draft).await
+    set_status(
+        db,
+        path,
+        session,
+        payload.expected_revision,
+        crate::domain::ArticleStatus::Draft,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "swagger", utoipa::path(
@@ -272,12 +301,16 @@ pub async fn delete_article(
     db: web::Data<Db>,
     path: web::Path<String>,
     session: AdminSession,
+    payload: web::Json<ArticleWriteRequest>,
 ) -> Result<HttpResponse, AppError> {
     session.validate(&db).await?;
     // Ensure it exists first so the response is 404, not a silent delete.
     let slug = path.into_inner();
     db.admin_get_article(&slug).await?;
-    db.delete_article(&slug).await?;
+    let expected = payload.expected_revision.ok_or_else(|| {
+        AppError::Conflict("expected_revision is required; reload the article".into())
+    })?;
+    db.delete_article(&slug, expected).await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({ "deleted": slug })))
 }
 
@@ -285,11 +318,13 @@ async fn set_status(
     db: web::Data<Db>,
     path: web::Path<String>,
     session: AdminSession,
+    expected_revision: Option<i64>,
     status: crate::domain::ArticleStatus,
 ) -> Result<HttpResponse, AppError> {
     session.validate(&db).await?;
     let slug = path.into_inner();
     let mut fields = article_fields(db.admin_get_article(&slug).await?)?;
+    check_revision(expected_revision, fields.revision)?;
     if status == crate::domain::ArticleStatus::Published {
         document::validate_document(&fields.document)?;
         document::validate_compiled(&fields.compiled)?;
@@ -299,8 +334,9 @@ async fn set_status(
         fields.published_at = Some(now_rfc3339());
     }
     fields.content_hash = compute_content_hash(&fields);
-    db.save_article(&fields).await?;
+    let saved = db.save_article(&fields, false).await?;
     Ok(HttpResponse::Ok().json(ArticleMutationResponse {
+        revision: saved.revision,
         slug: fields.slug,
         status: fields.status,
         content_hash: fields.content_hash,
@@ -319,6 +355,7 @@ fn article_fields(article: Article) -> Result<ArticleFields, AppError> {
         None => String::new(),
     };
     Ok(ArticleFields {
+        revision: article.revision,
         slug: article.slug,
         title: article.title,
         category: article.category,
@@ -432,6 +469,15 @@ fn slugify(title: &str) -> String {
         slug.pop();
     }
     slug
+}
+
+fn check_revision(expected: Option<i64>, current: i64) -> Result<(), AppError> {
+    if expected != Some(current) {
+        return Err(AppError::Conflict(
+            "article changed or expected_revision missing; reload before saving".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

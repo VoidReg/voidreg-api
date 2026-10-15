@@ -2,10 +2,14 @@ use actix_web::web::ServiceConfig;
 
 pub mod articles;
 pub mod comments;
+pub mod mcp;
 pub mod session;
 
 pub fn configure(cfg: &mut ServiceConfig) {
-    cfg.service(session::login_options)
+    cfg.service(mcp::list)
+        .service(mcp::create)
+        .service(mcp::revoke)
+        .service(session::login_options)
         .service(session::login)
         .service(session::show)
         .service(session::logout)

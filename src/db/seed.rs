@@ -77,6 +77,7 @@ pub async fn seed_if_empty(db: &mut toasty::Db) -> Result<(), AppError> {
     for article in seed.articles {
         let sections = serde_json::to_string(&article.sections)?;
         toasty::create!(models::Article {
+            revision: 1,
             slug: article.slug,
             title: article.title,
             category: article.category,
